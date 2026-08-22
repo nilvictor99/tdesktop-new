@@ -790,25 +790,29 @@ void Histories::deleteMessages(
 		not_null<History*> history,
 		const QVector<MTPint> &ids,
 		bool revoke) {
-	sendRequest(history, RequestType::Delete, [=](Fn<void()> finish) {
-		const auto done = [=](const MTPmessages_AffectedMessages &result) {
-			session().api().applyAffectedMessages(history->peer, result);
-			finish();
-			history->requestChatListMessage();
-		};
-		if (const auto channel = history->peer->asChannel()) {
-			return session().api().request(MTPchannels_DeleteMessages(
-				channel->inputChannel(),
-				MTP_vector<MTPint>(ids)
-			)).done(done).fail(finish).send();
-		} else {
-			using Flag = MTPmessages_DeleteMessages::Flag;
-			return session().api().request(MTPmessages_DeleteMessages(
-				MTP_flags(revoke ? Flag::f_revoke : Flag(0)),
-				MTP_vector<MTPint>(ids)
-			)).done(done).fail(finish).send();
-		}
-	});
+	constexpr auto kMaxDeletePerRequest = 100;
+	for (auto offset = 0; offset < ids.size(); offset += kMaxDeletePerRequest) {
+		const auto part = ids.mid(offset, kMaxDeletePerRequest);
+		sendRequest(history, RequestType::Delete, [=](Fn<void()> finish) {
+			const auto done = [=](const MTPmessages_AffectedMessages &result) {
+				session().api().applyAffectedMessages(history->peer, result);
+				finish();
+				history->requestChatListMessage();
+			};
+			if (const auto channel = history->peer->asChannel()) {
+				return session().api().request(MTPchannels_DeleteMessages(
+					channel->inputChannel(),
+					MTP_vector<MTPint>(part)
+				)).done(done).fail(finish).send();
+			} else {
+				using Flag = MTPmessages_DeleteMessages::Flag;
+				return session().api().request(MTPmessages_DeleteMessages(
+					MTP_flags(revoke ? Flag::f_revoke : Flag(0)),
+					MTP_vector<MTPint>(part)
+				)).done(done).fail(finish).send();
+			}
+		});
+	}
 }
 
 void Histories::deleteAllMessages(
