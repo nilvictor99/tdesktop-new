@@ -10,6 +10,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "api/api_premium.h"
 #include "base/call_delayed.h"
 #include "base/random.h"
+#include "base/timer.h"
+#include <algorithm>
+#include <functional>
 #include "lang/lang_keys.h"
 #include "base/qthelp_url.h"
 #include "storage/storage_account.h"
@@ -1852,6 +1855,33 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 		const auto showRecentForwardsToSelf = result.size() == 1
 			&& result.front()->peer()->isSelf()
 			&& history->session().premium();
+		struct MassProgressState {
+			int sent = 0;
+			int total = 0;
+			int activeThreads = 0;
+			base::weak_ptr<Ui::Toast::Instance> toast;
+		};
+		const auto progress = std::make_shared<MassProgressState>();
+		const auto updateMassProgress = [=] {
+			if (progress->total <= progress->sent) {
+				if (const auto t = progress->toast.get()) {
+					t->hideAnimated();
+				}
+				return;
+			}
+			if (const auto t = progress->toast.get()) {
+				t->hideAnimated();
+			}
+			progress->toast = Ui::Toast::Show(Ui::Toast::Config{
+				.text = (u"Reenviando %1 de %2… quedan %3"_q
+					.arg(progress->sent)
+					.arg(progress->total)
+					.arg(std::max(
+						0,
+						progress->total - progress->sent))),
+				.duration = 4000,
+			});
+		};
 		for (const auto &thread : result) {
 			const auto peer = thread->peer();
 			const auto threadHistory = thread->owningHistory();
@@ -1900,60 +1930,52 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 				| (sublistPeer ? Flag::f_reply_to : Flag())
 				| (options.suggest ? Flag::f_suggested_post : Flag())
 				| (options.effectId ? Flag::f_effect : Flag());
-			auto buildMessage = [=](
-					not_null<History*> history,
-					FullReplyTo replyTo)
-				-> Data::Histories::PreparedMessage {
-				const auto kGeneralId
-					= Data::ForumTopic::kGeneralId;
-				const auto realTopMsgId
-					= (replyTo.topicRootId == kGeneralId)
-					? MsgId(0)
-					: replyTo.topicRootId;
-				auto flags = sendFlags;
-				if (realTopMsgId) {
-					flags |= Flag::f_top_msg_id;
-				} else {
-					flags &= ~Flag::f_top_msg_id;
-				}
-				auto randoms = QVector<MTPlong>(msgCount);
-				for (auto &value : randoms) {
-					value = base::RandomValue<MTPlong>();
-				}
-				return MTPmessages_ForwardMessages(
-					MTP_flags(flags),
-					fromPeer->input(),
-					MTP_vector<MTPint>(mtpMsgIds),
-					MTP_vector<MTPlong>(randoms),
-					history->peer->input(),
-					MTP_int(realTopMsgId),
-					(sublistPeer
-						? MTP_inputReplyToMonoForum(
-							sublistPeer->input())
-						: MTPInputReplyTo()),
-					MTP_int(options.scheduled),
-					MTP_int(options.scheduleRepeatPeriod),
-					MTP_inputPeerEmpty(),
-					Data::ShortcutIdToMTP(
-						&history->session(),
-						options.shortcutId),
-					MTP_long(options.effectId),
-					MTP_int(videoTimestamp.value_or(0)),
-					MTP_long(starsPaid),
-					Api::SuggestToMTP(options.suggest));
+			constexpr auto kMassBatchSize = 100;
+			constexpr auto kMassBatchDelay = crl::time(300);
+			constexpr auto kMaxFloodRetries = 5;
+			constexpr auto kMaxFloodWaitSec = 60;
+
+			auto parts = std::vector<QVector<MTPint>>();
+			parts.reserve((msgCount + kMassBatchSize - 1) / kMassBatchSize);
+			for (auto off = 0; off < msgCount; off += kMassBatchSize) {
+				parts.push_back(mtpMsgIds.mid(off, kMassBatchSize));
+			}
+			progress->total += msgCount;
+			updateMassProgress();
+
+			if (!parts.empty()) {
+				progress->activeThreads += 1;
+			}
+
+			struct MassQueue {
+				base::Timer timer;
+				std::function<void()> step;
+				std::shared_ptr<MassQueue> keepAlive;
 			};
-			const auto requestDone = [=](
-					const MTPUpdates &updates,
-					mtpRequestId requestKey) {
-				if (showRecentForwardsToSelf) {
-					ApiWrap::ProcessRecentSelfForwards(
-						&threadHistory->session(),
-						updates,
-						peer->id,
-						history->peer->id);
+			const auto queue = std::make_shared<MassQueue>();
+			queue->keepAlive = queue;
+			queue->timer.setCallback([weak = std::weak_ptr<MassQueue>(queue)] {
+				if (const auto strong = weak.lock()) {
+					if (strong->step) {
+						strong->step();
+					}
 				}
-				state->requests.remove(requestKey);
-				if (state->requests.empty()) {
+			});
+			const auto idx = std::make_shared<int>(0);
+			const auto retries = std::make_shared<int>(0);
+
+			const auto qweak = std::weak_ptr<MassQueue>(queue);
+			const auto threadDone = [=] {
+				progress->activeThreads -= 1;
+			};
+			const auto finishRequest = [=](mtpRequestId key) {
+				state->requests.remove(key);
+				if (state->requests.empty()
+					&& progress->activeThreads == 0) {
+					if (const auto q = qweak.lock()) {
+						q->keepAlive = nullptr;
+					}
+					updateMassProgress();
 					if (show->valid()) {
 						show->hideLayer();
 						ShowForwardedMessageToast(
@@ -1963,45 +1985,149 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 					}
 				}
 			};
-			const auto requestFail = [=](
-					const MTP::Error &error,
-					mtpRequestId requestKey) {
-				const auto type = error.type();
-				if (type.startsWith(
-						u"ALLOW_PAYMENT_REQUIRED_"_q)) {
-					show->showToast(
-						u"Payment requirements changed. "
-						"Please, try again."_q);
-				} else if (type
-					== u"VOICE_MESSAGES_FORBIDDEN"_q) {
-					show->showToast(
-						tr::lng_restricted_send_voice_messages(
-							tr::now,
-							lt_user,
-							peer->name()));
-				}
-				state->requests.remove(requestKey);
-				if (state->requests.empty()) {
-					if (show->valid()) {
-						show->hideLayer();
-					}
-				}
-			};
-			const auto requestKey = ++state->nextRequestKey;
-			state->requests.insert(requestKey);
-			histories.sendPreparedMessage(
+			queue->step = [weak = std::weak_ptr<MassQueue>(queue),
+				parts = std::move(parts),
+				idx,
+				retries,
+				state,
+				show,
+				historiesPtr = &histories,
 				threadHistory,
-				FullReplyTo{ .topicRootId = topicRootId },
-				uint64(0),
-				std::move(buildMessage),
-				[=](const MTPUpdates &updates,
-						const MTP::Response &) {
-					requestDone(updates, requestKey);
-				},
-				[=](const MTP::Error &error,
-						const MTP::Response &) {
-					requestFail(error, requestKey);
-				});
+				peer,
+				history,
+				fromPeer,
+				sublistPeer,
+				topicRootId,
+				starsPaid,
+				sendFlags,
+				options,
+				videoTimestamp,
+				showRecentForwardsToSelf,
+				donePhraseArgs,
+				progress,
+				updateMassProgress,
+				finishRequest,
+				threadDone] {
+				const auto q = weak.lock();
+				if (!q || (*idx >= int(parts.size()))) {
+					return;
+				}
+				const auto part = parts[*idx];
+				const auto paid = (*idx == 0) ? starsPaid : 0;
+				const auto partFlags = sendFlags
+					| (paid ? Flag::f_allow_paid_stars : Flag());
+				auto buildMessage = [=](
+						not_null<History*> history,
+						FullReplyTo replyTo)
+						-> Data::Histories::PreparedMessage {
+					const auto kGeneralId
+						= Data::ForumTopic::kGeneralId;
+					const auto realTopMsgId
+						= (replyTo.topicRootId == kGeneralId)
+						? MsgId(0)
+						: replyTo.topicRootId;
+					auto flags = partFlags;
+					if (realTopMsgId) {
+						flags |= Flag::f_top_msg_id;
+					} else {
+						flags &= ~Flag::f_top_msg_id;
+					}
+					auto randoms = QVector<MTPlong>(part.size());
+					for (auto &value : randoms) {
+						value = base::RandomValue<MTPlong>();
+					}
+					return MTPmessages_ForwardMessages(
+						MTP_flags(flags),
+						fromPeer->input(),
+						MTP_vector<MTPint>(part),
+						MTP_vector<MTPlong>(randoms),
+						history->peer->input(),
+						MTP_int(realTopMsgId),
+						(sublistPeer
+							? MTP_inputReplyToMonoForum(
+								sublistPeer->input())
+							: MTPInputReplyTo()),
+						MTP_int(options.scheduled),
+						MTP_int(options.scheduleRepeatPeriod),
+						MTP_inputPeerEmpty(),
+						Data::ShortcutIdToMTP(
+							&history->session(),
+							options.shortcutId),
+						MTP_long(options.effectId),
+						MTP_int(videoTimestamp.value_or(0)),
+						MTP_long(paid),
+						Api::SuggestToMTP(options.suggest));
+				};
+				const auto requestKey = ++state->nextRequestKey;
+				state->requests.insert(requestKey);
+				historiesPtr->sendPreparedMessage(
+					threadHistory,
+					FullReplyTo{ .topicRootId = topicRootId },
+					uint64(0),
+					std::move(buildMessage),
+					[=, &threadDone](const MTPUpdates &updates,
+							const MTP::Response &) {
+						if (showRecentForwardsToSelf) {
+							ApiWrap::ProcessRecentSelfForwards(
+								&threadHistory->session(),
+								updates,
+								peer->id,
+								history->peer->id);
+						}
+						progress->sent += int(part.size());
+						updateMassProgress();
+						*retries = 0;
+						++(*idx);
+						if (*idx >= int(parts.size())) {
+							threadDone();
+						} else if (const auto s = weak.lock()) {
+							s->timer.callOnce(kMassBatchDelay);
+						}
+						finishRequest(requestKey);
+					},
+					[=, &threadDone](const MTP::Error &error,
+							const MTP::Response &) {
+						const auto type = error.type();
+						const auto floodPrefix = u"FLOOD_WAIT_"_q;
+						if (type.startsWith(floodPrefix)
+							&& (*retries < kMaxFloodRetries)) {
+							const auto secs = std::clamp(
+								base::StringViewMid(
+									type,
+									floodPrefix.size()).toInt(),
+								1,
+								kMaxFloodWaitSec);
+							++(*retries);
+							state->requests.remove(requestKey);
+							if (const auto s = weak.lock()) {
+								s->timer.callOnce(secs * crl::time(1000));
+							}
+							return;
+						}
+						if (type.startsWith(
+								u"ALLOW_PAYMENT_REQUIRED_"_q)) {
+							show->showToast(
+								u"Payment requirements changed. "
+								"Please, try again."_q);
+						} else if (type
+							== u"VOICE_MESSAGES_FORBIDDEN"_q) {
+							show->showToast(
+								tr::lng_restricted_send_voice_messages(
+									tr::now,
+									lt_user,
+									peer->name()));
+						}
+						*retries = 0;
+						++(*idx);
+						if (*idx >= int(parts.size())) {
+							threadDone();
+						} else if (const auto s = weak.lock()) {
+							s->timer.callOnce(kMassBatchDelay);
+						}
+						finishRequest(requestKey);
+					});
+			};
+			queue->step();
 		}
 		if (state->requests.empty()) {
 			if (show->valid()) {

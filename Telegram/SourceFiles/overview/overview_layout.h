@@ -430,6 +430,7 @@ struct DocumentFields {
 	not_null<DocumentData*> document;
 	TimeId dateOverride = 0;
 	bool forceFileLayout = false;
+	bool hideName = false;
 	Fn<std::optional<DocumentExternalLoading>()> externalLoading;
 	Fn<void()> externalCancel;
 };
@@ -443,6 +444,7 @@ public:
 		const style::OverviewFileLayout &st);
 
 	void initDimensions() override;
+	int32 resizeGetHeight(int32 width) override;
 	void paint(Painter &p, const QRect &clip, TextSelection selection, const PaintContext *context) override;
 	[[nodiscard]] bool elementsAnimating() const override;
 	TextState getState(
@@ -485,6 +487,7 @@ private:
 
 	bool _thumbLoaded = false;
 	bool _forceFileLayout = false;
+	bool _hideName = false;
 	QPixmap _thumb;
 
 	Ui::Text::String _name;

@@ -65,6 +65,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/platform/base_platform_info.h"
 #include "base/weak_ptr.h"
 #include "base/call_delayed.h"
+#include "base/timer.h"
+
+#include <algorithm>
 #include "media/player/media_player_instance.h"
 #include "boxes/delete_messages_box.h"
 #include "boxes/peer_list_controllers.h"
@@ -170,13 +173,14 @@ ListWidget::ListWidget(
 	_provider->type(),
 	[=] { scrollDateCheck(); },
 	[=] { scrollDateHide(); }))
-, _selectedLimit(std::numeric_limits<int>::max())
+	, _selectedLimit(std::numeric_limits<int>::max())
 , _storiesAddToAlbumId(controller->storiesAddToAlbumId())
 , _hiddenMark(std::make_unique<StickerPremiumMark>(
 		&_controller->session(),
 		st::giftBoxHiddenMark,
 		RectPart::Center)) {
 	_zoom = std::make_unique<ListZoom>(this);
+	_autoScrollTimer.setCallback([this] { autoScrollStep(); });
 	start();
 }
 
@@ -768,6 +772,7 @@ int ListWidget::resizeGetHeight(int newWidth) {
 		for (auto &section : _sections) {
 			section.setCanReorder(canReorder());
 			section.setMinGridSize(gridSize);
+			section.setForcedColumns(_fileGridColumns);
 			section.resizeToWidth(newWidth);
 		}
 	}
@@ -1035,6 +1040,16 @@ bool ListWidget::supportsMediaFilter() const {
 	return _provider->supportsMediaFilter();
 }
 
+void ListWidget::setFileGridColumns(int columns) {
+	if (_fileGridColumns == columns) {
+		return;
+	}
+	clearSelected();
+	_fileGridColumns = columns;
+	resizeGetHeight(width());
+	update();
+}
+
 MsgId ListWidget::topicRootId() const {
 	const auto topic = _controller->key().topic();
 	return topic ? topic->rootId() : MsgId(0);
@@ -1168,6 +1183,7 @@ void ListWidget::mouseMoveEvent(QMouseEvent *e) {
 		mouseReleaseEvent(e);
 	}
 	mouseActionUpdate(e->globalPos());
+	updateAutoScroll();
 }
 
 void ListWidget::mouseReleaseEvent(QMouseEvent *e) {
@@ -2387,6 +2403,8 @@ void ListWidget::performDrag() {
 void ListWidget::mouseActionFinish(
 		const QPoint &globalPosition,
 		Qt::MouseButton button) {
+	_autoScrollActive = false;
+	_autoScrollTimer.cancel();
 	mouseActionUpdate(globalPosition);
 
 	const auto pressState = base::take(_pressState);
@@ -2520,6 +2538,56 @@ int ListWidget::recountHeight() {
 
 void ListWidget::mouseActionUpdate() {
 	mouseActionUpdate(_mousePosition);
+}
+
+
+void ListWidget::updateAutoScroll() {
+	const auto selecting = (_mouseAction == MouseAction::Selecting);
+	if (!selecting) {
+		_autoScrollActive = false;
+		return;
+	}
+	const auto local = mapFromGlobal(_mousePosition);
+	constexpr auto kEdge = 40;
+	const auto nearEdge = (local.y() < _visibleTop + kEdge)
+		|| (local.y() > _visibleBottom - kEdge);
+	if (nearEdge && !_autoScrollActive) {
+		_autoScrollActive = true;
+		_autoScrollTimer.callOnce(15);
+	} else if (!nearEdge) {
+		_autoScrollActive = false;
+	}
+}
+
+void ListWidget::autoScrollStep() {
+	if (_mouseAction != MouseAction::Selecting) {
+		_autoScrollActive = false;
+		return;
+	}
+	const auto local = mapFromGlobal(_mousePosition);
+	constexpr auto kEdge = 40;
+	auto delta = 0;
+	if (local.y() < _visibleTop + kEdge) {
+		delta = -(_visibleTop + kEdge - local.y());
+	} else if (local.y() > _visibleBottom - kEdge) {
+		delta = local.y() - (_visibleBottom - kEdge);
+	}
+	if (!delta || (_visibleBottom <= _visibleTop)) {
+		_autoScrollActive = false;
+		return;
+	}
+	const auto speed = std::clamp(delta / 2, 6, 30)
+		* ((delta < 0) ? -1 : 1);
+	const auto visibleH = _visibleBottom - _visibleTop;
+	const auto maxTop = std::max(0, height() - visibleH);
+	const auto newTop = std::clamp(_visibleTop + speed, 0, maxTop);
+	if (newTop != _visibleTop) {
+		_scrollToRequests.fire_copy(newTop);
+		mouseActionUpdate(_mousePosition);
+		update();
+	}
+	_autoScrollActive = false;
+	updateAutoScroll();
 }
 
 std::vector<ListSection>::iterator ListWidget::findSectionByItem(

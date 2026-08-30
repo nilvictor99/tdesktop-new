@@ -891,7 +891,8 @@ Storage::SharedMediaTypesMask MediaPhoto::sharedMediaTypes() const {
 	}
 	return Storage::SharedMediaTypesMask{}
 		.added(Type::Photo)
-		.added(Type::PhotoVideo);
+		.added(Type::PhotoVideo)
+		.added(Type::FilesPhotos);
 }
 
 bool MediaPhoto::canBeGrouped() const {
@@ -1135,7 +1136,9 @@ Storage::SharedMediaTypesMask MediaFile::sharedMediaTypes() const {
 	} else if (_document->isSharedMediaMusic()) {
 		return Type::MusicFile;
 	}
-	return Type::File;
+	return Storage::SharedMediaTypesMask{}
+		.added(Type::File)
+		.added(Type::FilesPhotos);
 }
 
 bool MediaFile::canBeGrouped() const {

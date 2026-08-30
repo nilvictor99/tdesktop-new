@@ -174,10 +174,11 @@ bool SparseIdsSliceBuilder::applyUpdate(
 			&& (range2.from <= range1.till);
 	};
 	auto needMergeMessages = (update.messages != nullptr)
-		&& intersects(update.range, {
-			_ids.empty() ? _key : _ids.front(),
-			_ids.empty() ? _key : _ids.back()
-		});
+		&& (_ids.empty()
+			|| intersects(update.range, {
+				_ids.front(),
+				_ids.back()
+			}));
 	if (!needMergeMessages && !update.count) {
 		return false;
 	}

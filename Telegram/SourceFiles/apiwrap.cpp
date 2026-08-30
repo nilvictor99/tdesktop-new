@@ -3632,6 +3632,16 @@ void ApiWrap::requestSharedMedia(
 		return;
 	}
 
+	if (type == SharedMediaType::FilesPhotos) {
+		requestSharedMediaFilesPhotos(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			messageId,
+			slice);
+		return;
+	}
+
 	const auto prepared = Api::PrepareSearchRequest(
 		peer,
 		topicRootId,
@@ -3673,6 +3683,136 @@ void ApiWrap::requestSharedMedia(
 	_sharedMediaRequests.emplace(key);
 }
 
+void ApiWrap::requestSharedMediaFilesPhotos(
+		not_null<PeerData*> peer,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		MsgId messageId,
+		SliceType slice) {
+	const auto key = 	SharedMediaRequest{
+		peer,
+		topicRootId,
+		monoforumPeerId,
+		SharedMediaType::FilesPhotos,
+		messageId,
+		slice,
+	};
+	LOG(("[FILESPHOTOS] request msg=%1 slice=%2")
+		.arg(qint64(messageId.bare))
+		.arg(int(slice)));
+	_sharedMediaRequests.emplace(key);
+
+	struct State {
+		std::optional<Api::SearchResult> photo;
+		std::optional<Api::SearchResult> file;
+	};
+	const auto state = std::make_shared<State>();
+
+	const auto history = _session->data().history(peer);
+	auto &histories = history->owner().histories();
+	const auto historiesPtr = &histories;
+	const auto requestType = Data::Histories::RequestType::History;
+
+	auto doneCount = std::make_shared<int>(0);
+	const auto finishOne = [=] {
+		if (++*doneCount < 2) {
+			return;
+		}
+		_sharedMediaRequests.remove(key);
+		Expects(state->photo.has_value() && state->file.has_value());
+		auto merged = Api::SearchResult();
+		auto mergeOne = [&](const Api::SearchResult &parsed) {
+			merged.fullCount += parsed.fullCount;
+			merged.messageIds.insert(
+				merged.messageIds.end(),
+				parsed.messageIds.begin(),
+				parsed.messageIds.end());
+		};
+		mergeOne(*state->photo);
+		mergeOne(*state->file);
+		if (!merged.messageIds.empty()) {
+			const auto minmax = std::minmax_element(
+				merged.messageIds.begin(),
+				merged.messageIds.end());
+			// FilesPhotos es la UNION de dos secuencias de servidor (Photo+File).
+			// Un solo noSkipRange por lote no puede representar "contiguo" sobre
+			// esa unión; para que el sparse-loader acumule todas las páginas en
+			// UNA slice creciente (y así explore hacia atrás como Media), forzamos
+			// el limite superior al mensaje más nuevo.
+			merged.noSkipRange = MsgRange{
+				*minmax.first,
+				ServerMaxMsgId
+			};
+		} else {
+			// Lote vacío: propagar el rango de "fin de dirección" ya resuelto por
+			// ParseSearchResult, para que el loader deje de pedir (evita bucles).
+			merged.noSkipRange = MsgRange{
+				qMin(
+					state->photo->noSkipRange.from,
+					state->file->noSkipRange.from),
+				qMax(
+					state->photo->noSkipRange.till,
+					state->file->noSkipRange.till)
+			};
+		}
+		LOG(("[FILESPHOTOS] merge msg=%1 slice=%2 n=%3 full=%4 range=%5..%6")
+			.arg(qint64(messageId.bare))
+			.arg(int(slice))
+			.arg(qint64(merged.messageIds.size()))
+			.arg(merged.fullCount)
+			.arg(qint64(merged.noSkipRange.from.bare))
+			.arg(qint64(merged.noSkipRange.till.bare)));
+		sharedMediaDone(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			SharedMediaType::FilesPhotos,
+			std::move(merged));
+	};
+
+	const auto sendOne = [=](SharedMediaType type) {
+		const auto prepared = Api::PrepareSearchRequest(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			type,
+			QString(),
+			messageId,
+			slice);
+		const auto captured = [&]() -> std::optional<Api::SearchResult>* {
+			if (type == SharedMediaType::Photo) {
+				return &state->photo;
+			}
+			return &state->file;
+		}();
+		if (!prepared) {
+			*captured = Api::SearchResult();
+			finishOne();
+			return;
+		}
+		historiesPtr->sendRequest(history, requestType, [=](Fn<void()> finish) {
+			return request(std::move(*prepared)
+			).done([=](const Api::SearchRequestResult &result) {
+				*captured = Api::ParseSearchResult(
+					peer,
+					type,
+					messageId,
+					slice,
+					result);
+				finishOne();
+				finish();
+			}).fail([=] {
+				*captured = Api::SearchResult();
+				finishOne();
+				finish();
+			}).send();
+		});
+	};
+
+	sendOne(SharedMediaType::Photo);
+	sendOne(SharedMediaType::File);
+}
+
 void ApiWrap::sharedMediaDone(
 		not_null<PeerData*> peer,
 		MsgId topicRootId,
@@ -3685,6 +3825,12 @@ void ApiWrap::sharedMediaDone(
 		return;
 	}
 	const auto hasMessages = !parsed.messageIds.empty();
+	LOG(("[FILESPHOTOS] done type=%1 msg=%2 full=%3 range=%4..%5")
+		.arg(int(type))
+		.arg(qint64(parsed.messageIds.size()))
+		.arg(parsed.fullCount)
+		.arg(qint64(parsed.noSkipRange.from.bare))
+		.arg(qint64(parsed.noSkipRange.till.bare)));
 	_session->storage().add(Storage::SharedMediaAddSlice(
 		peer->id,
 		topicRootId,

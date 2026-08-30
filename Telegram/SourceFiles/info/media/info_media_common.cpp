@@ -63,6 +63,7 @@ int MinItemHeight(Type type, int width) {
 	auto &songSt = st::overviewFileLayout;
 
 	switch (type) {
+	case Type::FilesPhotos:
 	case Type::Photo:
 	case Type::GIF:
 	case Type::Video:

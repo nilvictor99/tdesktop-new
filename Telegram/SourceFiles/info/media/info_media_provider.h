@@ -51,6 +51,7 @@ public:
 	void jumpToMessage(MsgId, Fn<void(FullMsgId)> done) override;
 
 	void setMediaFilter(MediaFilter filter) override;
+	[[nodiscard]] MediaFilter mediaFilter() const override { return _filter; }
 	[[nodiscard]] bool supportsMediaFilter() const override;
 
 	[[nodiscard]] bool anchorWhileAtTop() override;

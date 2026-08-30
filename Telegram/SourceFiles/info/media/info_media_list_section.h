@@ -28,6 +28,7 @@ public:
 	[[nodiscard]] int top() const;
 	void setCanReorder(bool);
 	void setMinGridSize(int value);
+	void setForcedColumns(int value);
 	void resizeToWidth(int newWidth);
 	[[nodiscard]] int height() const;
 
@@ -72,6 +73,14 @@ private:
 		not_null<const BaseLayout*> item,
 		const ListContext &context) const;
 
+	[[nodiscard]] bool fileTileMode() const;
+	[[nodiscard]] int visualHeight(not_null<const BaseLayout*> item) const;
+	void paintFileTile(
+		Painter &p,
+		not_null<BaseLayout*> item,
+		const QRect &rect,
+		const ListContext &context) const;
+
 	int recountHeight();
 	void refreshHeight();
 
@@ -93,6 +102,7 @@ private:
 	int _top = 0;
 	int _height = 0;
 	int _minGridSize = 0;
+	int _forcedColumns = 0;
 	bool _canReorder = false;
 
 	Mosaic::Layout::MosaicLayout<BaseLayout> _mosaic;

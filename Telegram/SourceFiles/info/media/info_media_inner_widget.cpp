@@ -24,6 +24,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/slide_wrap.h"
 #include "ui/wrap/vertical_layout.h"
 #include "ui/search_field_controller.h"
+#include "data/data_shared_media.h"
 #include "styles/style_info.h"
 #include "lang/lang_keys.h"
 
@@ -42,6 +43,7 @@ InnerWidget::InnerWidget(
 		_empty->lifetime());
 	_list = setupList();
 	setupMediaFilter();
+	setupFileViewToggle();
 }
 
 // Allows showing additional shared media links and tabs.
@@ -185,17 +187,41 @@ void InnerWidget::setupMediaFilter() {
 	_filter->addSection(tr::lng_media_type_videos(tr::now));
 	_filter->setActiveSectionFast(0);
 	_filter->sectionActivated(
-	) | rpl::on_next([=](int index) {
-		const auto filter = [&] {
-			switch (index) {
-			case 0: return MediaFilter::All;
-			case 1: return MediaFilter::Photos;
-			case 2: return MediaFilter::Videos;
-			}
-			Unexpected("Index in InnerWidget::setupMediaFilter()");
-		}();
-		_list->setMediaFilter(filter);
+	) | rpl::on_next([=](int section) {
+		switch (section) {
+		case 1:
+			_list->setMediaFilter(MediaFilter::Photos);
+			break;
+		case 2:
+			_list->setMediaFilter(MediaFilter::Videos);
+			break;
+		default:
+			_list->setMediaFilter(MediaFilter::All);
+			break;
+		}
 	}, _filter->lifetime());
+}
+
+void InnerWidget::setupFileViewToggle() {
+	if (type() != Type::File) {
+		return;
+	}
+	_rows.create(this);
+	_rows->show();
+	_rows->addSection(u"Lista"_q);
+	_rows->addSection(u"4"_q);
+	_rows->setActiveSectionFast(0);
+	_rows->sectionActivated(
+	) | rpl::on_next([=](int index) {
+		const auto columns = [&] {
+			switch (index) {
+			case 0: return 0;
+			case 1: return 4;
+			}
+			Unexpected("Index in InnerWidget::setupFileViewToggle()");
+		}();
+		_list->setFileGridColumns(columns);
+	}, _rows->lifetime());
 }
 
 void InnerWidget::saveState(not_null<Memento*> memento) {
@@ -228,6 +254,9 @@ int InnerWidget::resizeGetHeight(int newWidth) {
 	if (_filter) {
 		_filter->resizeToWidth(newWidth);
 	}
+	if (_rows) {
+		_rows->resizeToWidth(newWidth);
+	}
 	_list->resizeToWidth(newWidth);
 	_empty->resizeToWidth(newWidth);
 	return recountHeight();
@@ -249,6 +278,10 @@ int InnerWidget::recountHeight() {
 	if (_filter) {
 		_filter->moveToLeft(0, top);
 		top += _filter->heightNoMargins();
+	}
+	if (_rows) {
+		_rows->moveToLeft(0, top);
+		top += _rows->heightNoMargins();
 	}
 	auto listHeight = 0;
 	if (_list) {

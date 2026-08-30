@@ -601,6 +601,15 @@ rpl::producer<int> SharedMediaCountValue(
 		PeerId monoforumPeerId,
 		PeerData *migrated,
 		Storage::SharedMediaType type) {
+	using Type = Storage::SharedMediaType;
+	if (type == Type::FilesPhotos) {
+		return rpl::combine(
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Photo),
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::File)
+		) | rpl::map([](int photos, int files) {
+			return photos + files;
+		});
+	}
 	auto aroundId = 0;
 	auto limit = 0;
 	auto updated = SharedMediaMergedViewer(

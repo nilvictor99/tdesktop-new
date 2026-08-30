@@ -12,8 +12,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/rect.h"
 #include "ui/painter.h"
 #include "ui/rows_scroll_cache.h"
+#include "data/data_document.h"
+#include "data/data_media_types.h"
+#include "history/history_item.h"
 #include "styles/style_chat_helpers.h"
 #include "styles/style_info.h"
+
+#include <QPainterPath>
 
 namespace Info::Media {
 namespace {
@@ -27,6 +32,10 @@ ListSection::ListSection(Type type, not_null<ListSectionDelegate*> delegate)
 , _delegate(delegate)
 , _hasFloatingHeader(delegate->sectionHasFloatingHeader())
 , _mosaic(st::emojiPanWidth - st::inlineResultsLeft) {
+}
+
+bool ListSection::fileTileMode() const {
+	return (_type == Type::File) && (_forcedColumns > 1);
 }
 
 bool ListSection::empty() const {
@@ -53,6 +62,10 @@ void ListSection::setCanReorder(bool value) {
 
 void ListSection::setMinGridSize(int value) {
 	_minGridSize = value;
+}
+
+void ListSection::setForcedColumns(int value) {
+	_forcedColumns = value;
 }
 
 int ListSection::height() const {
@@ -122,6 +135,11 @@ void ListSection::reorderItems(int oldPosition, int newPosition) {
 	refreshHeight();
 }
 
+int ListSection::visualHeight(
+		not_null<const BaseLayout*> item) const {
+	return fileTileMode() ? _itemHeight : item->height();
+}
+
 QRect ListSection::findItemRect(
 		not_null<const BaseLayout*> item) const {
 	const auto position = item->position();
@@ -132,7 +150,11 @@ QRect ListSection::findItemRect(
 	const auto indexInRow = position % _itemsInRow;
 	const auto left = _itemsLeft
 		+ indexInRow * (_itemWidth + st::infoMediaSkip);
-	return QRect(left, top, _itemWidth, item->height());
+	return QRect(
+		left,
+		top,
+		_itemWidth,
+		fileTileMode() ? _itemHeight : item->height());
 }
 
 ListFoundItem ListSection::completeResult(
@@ -199,7 +221,7 @@ auto ListSection::findItemAfterTop(
 		std::less_equal<>(),
 		[this](const auto &item) {
 			const auto itemTop = item->position() / _itemsInRow;
-			return itemTop + item->height();
+			return itemTop + visualHeight(item);
 		});
 }
 
@@ -213,7 +235,7 @@ auto ListSection::findItemAfterTop(
 		std::less_equal<>(),
 		[this](const auto &item) {
 			const auto itemTop = item->position() / _itemsInRow;
-			return itemTop + item->height();
+			return itemTop + visualHeight(item);
 		});
 }
 
@@ -270,6 +292,21 @@ void ListSection::paint(
 	const auto tillIt = findItemAfterBottom(
 		fromIt,
 		clip.y() + clip.height());
+	if (fileTileMode()) {
+		for (auto it = fromIt; it != tillIt; ++it) {
+			const auto item = *it;
+			if (item == context.draggedItem) {
+				continue;
+			}
+			auto rect = findItemRect(item);
+			rect.translate(item->shift());
+			if (!rect.intersects(clip)) {
+				continue;
+			}
+			paintFileTile(p, item, rect, context);
+		}
+		return;
+	}
 	const auto cache = (context.scrollCache
 		&& context.scrollCache->scrolling()
 		&& isOneColumn())
@@ -411,6 +448,7 @@ void ListSection::resizeToWidth(int newWidth) {
 		}
 	};
 	switch (_type) {
+	case Type::FilesPhotos:
 	case Type::Photo:
 	case Type::Video:
 	case Type::PhotoVideo:
@@ -439,9 +477,24 @@ void ListSection::resizeToWidth(int newWidth) {
 		break;
 	case Type::File:
 	case Type::Link: {
-		const auto itemsLeft = st::infoMediaHeaderPosition.x();
-		const auto itemWidth = newWidth - 2 * itemsLeft;
-		resizeOneColumn(itemsLeft, itemWidth);
+		if (_type == Type::File && _forcedColumns > 1) {
+			const auto skip = st::infoMediaSkip;
+			_itemsLeft = st::infoMediaLeft;
+			_itemsTop = st::infoMediaSkip;
+			_itemsInRow = _forcedColumns;
+			_itemWidth = ((newWidth - _itemsLeft * 2 + skip)
+				/ _itemsInRow) - st::infoMediaSkip;
+			_itemsLeft = (newWidth
+				- (_itemWidth + skip) * _itemsInRow + skip) / 2;
+			for (auto &item : _items) {
+				item->resizeGetHeight(_itemWidth);
+			}
+			_itemHeight = _itemWidth;
+		} else {
+			const auto itemsLeft = st::infoMediaHeaderPosition.x();
+			const auto itemWidth = newWidth - 2 * itemsLeft;
+			resizeOneColumn(itemsLeft, itemWidth);
+		}
 	} break;
 	}
 
@@ -452,6 +505,7 @@ int ListSection::recountHeight() {
 	auto result = headerHeight();
 
 	switch (_type) {
+	case Type::FilesPhotos:
 	case Type::Photo:
 	case Type::Video:
 	case Type::PhotoVideo:
@@ -482,6 +536,25 @@ int ListSection::recountHeight() {
 	case Type::File:
 	case Type::MusicFile:
 	case Type::Link:
+		if (_type == Type::File && _forcedColumns > 1) {
+			const auto itemHeight = _itemHeight + st::infoMediaSkip;
+			auto index = 0;
+			result += _itemsTop;
+			for (auto &item : _items) {
+				item->setPosition(_itemsInRow * result + index);
+				if (++index == _itemsInRow) {
+					result += itemHeight;
+					index = 0;
+				}
+			}
+			if (_items.size() % _itemsInRow) {
+				_rowsCount = int(_items.size()) / _itemsInRow + 1;
+				result += itemHeight;
+			} else {
+				_rowsCount = int(_items.size()) / _itemsInRow;
+			}
+			break;
+		}
 		for (auto &item : _items) {
 			item->setPosition(result);
 			result += item->height();
@@ -491,6 +564,69 @@ int ListSection::recountHeight() {
 	}
 
 	return result;
+}
+
+void ListSection::paintFileTile(
+		Painter &p,
+		not_null<BaseLayout*> item,
+		const QRect &rect,
+		const ListContext &context) const {
+	const auto selected
+		= itemSelection(item, context) != TextSelection();
+
+	p.setPen(Qt::NoPen);
+	p.setBrush(st::windowBgRipple);
+	p.drawRoundedRect(rect, st::roundRadiusLarge, st::roundRadiusLarge);
+
+	const auto side = std::min(
+		rect.width() * 55 / 100,
+		rect.height() * 60 / 100);
+	const auto iconRect = QRect(
+		rect.x() + (rect.width() - side) / 2,
+		rect.y() + (rect.height() - side) / 2,
+		side,
+		side);
+	p.setBrush(QColor(0x33, 0x90, 0xEC));
+	p.drawRoundedRect(iconRect, 4, 4);
+
+	QPainterPath fold;
+	fold.moveTo(iconRect.right() - side * 18 / 100, iconRect.top());
+	fold.lineTo(iconRect.right(), iconRect.top() + side * 18 / 100);
+	fold.lineTo(iconRect.right() - side * 18 / 100, iconRect.top() + side * 18 / 100);
+	fold.closeSubpath();
+	p.setBrush(QColor(255, 255, 255, 70));
+	p.drawPath(fold);
+
+	p.setBrush(QColor(255, 255, 255, 140));
+	const auto lineW = side * 3 / 5;
+	for (auto i = 0; i != 3; ++i) {
+		p.drawRoundedRect(
+			QRect(
+				iconRect.x() + (side - lineW) / 2,
+				iconRect.y() + side * (34 + i * 20) / 100,
+				lineW,
+				std::max(2, side / 22)),
+			1,
+			1);
+	}
+
+	if (selected) {
+		p.setPen(Qt::NoPen);
+		p.setBrush(QColor(0, 0, 0, 110));
+		p.drawRoundedRect(rect, st::roundRadiusLarge, st::roundRadiusLarge);
+		constexpr auto kCheck = 22;
+		const auto circle = QRect(
+			rect.right() - kCheck - 6,
+			rect.top() + 6,
+			kCheck,
+			kCheck);
+		p.setBrush(QColor(0x33, 0x90, 0xEC));
+		p.drawEllipse(circle);
+		p.setPen(QPen(QColor(255, 255, 255), 2));
+		const auto cx = circle.center();
+		p.drawLine(cx + QPoint(-5, 0), cx + QPoint(-1, 4));
+		p.drawLine(cx + QPoint(-1, 4), cx + QPoint(6, -4));
+	}
 }
 
 void ListSection::refreshHeight() {

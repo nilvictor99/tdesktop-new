@@ -1324,8 +1324,9 @@ Document::Document(
 	parent->fullId()))
 , _st(st)
 , _generic(::Layout::DocumentGenericPreview::Create(_data))
-, _externalLoading(std::move(fields.externalLoading))
-, _forceFileLayout(fields.forceFileLayout)
+	, _externalLoading(std::move(fields.externalLoading))
+	, _forceFileLayout(fields.forceFileLayout)
+	, _hideName(fields.hideName)
 , _date(langDateTime(base::unixtime::parse(fields.dateOverride
 	? fields.dateOverride
 	: parent->date())))
@@ -1388,11 +1389,25 @@ bool Document::downloadInCorner() const {
 
 void Document::initDimensions() {
 	_maxw = _st.maxWidth;
-	if (songLayout()) {
+	if (_hideName) {
+		_minh = _st.fileThumbSize;
+	} else if (songLayout()) {
 		_minh = _st.songPadding.top() + _st.songThumbSize + _st.songPadding.bottom();
 	} else {
 		_minh = _st.filePadding.top() + _st.fileThumbSize + _st.filePadding.bottom() + st::lineWidth;
 	}
+}
+
+int32 Document::resizeGetHeight(int32 width) {
+	if (_hideName) {
+		// In the square media grid every cell (photo and file tile alike)
+		// must be the uniform cell width, so the whole section keeps a
+		// consistent geometry (and the file preview stays centered).
+		_width = qMin(width, _maxw);
+		_minh = _height = _width;
+		return _height;
+	}
+	return AbstractLayoutItem::resizeGetHeight(width);
 }
 
 void Document::paint(Painter &p, const QRect &clip, TextSelection selection, const PaintContext *context) {
@@ -1496,6 +1511,67 @@ void Document::paint(Painter &p, const QRect &clip, TextSelection selection, con
 
 			drawCornerDownload(p, selected, context);
 		}
+	} else if (_hideName) {
+		const auto thumbSize = qMin(_width, _st.fileThumbSize);
+		const auto thumbX = (_width - thumbSize) / 2;
+		const auto thumbY = (_minh - thumbSize) / 2;
+		QRect rthumb(thumbX, thumbY, thumbSize, thumbSize);
+		if (clip.intersects(rthumb)) {
+			paintThumbnail(p, rthumb, wthumb, !radial && loaded);
+			if (selected) {
+				p.setPen(Qt::NoPen);
+				p.setBrush(st::defaultTextPalette.selectOverlay);
+				p.drawRoundedRect(
+					rthumb,
+					st::roundRadiusSmall,
+					st::roundRadiusSmall);
+			}
+
+			if (radial || (!loaded && !activeLoading())) {
+				QRect inner(rthumb.x() + (rthumb.width() - _st.songThumbSize) / 2, rthumb.y() + (rthumb.height() - _st.songThumbSize) / 2, _st.songThumbSize, _st.songThumbSize);
+				if (clip.intersects(inner)) {
+					auto radialOpacity = (radial && loaded && !_data->uploading()) ? _radial->opacity() : 1;
+					p.setPen(Qt::NoPen);
+					if (selected) {
+						p.setBrush(wthumb
+							? st::msgDateImgBgSelected
+							: _generic.selected);
+					} else {
+						auto over = ClickHandler::showAsActive(activeLoading()
+							? _cancell
+							: _savel);
+						p.setBrush(anim::brush(
+							wthumb ? st::msgDateImgBg : _generic.dark,
+							wthumb ? st::msgDateImgBgOver : _generic.over,
+							_a_iconOver.value(over ? 1. : 0.)));
+					}
+					p.setOpacity(radialOpacity * p.opacity());
+
+					{
+						PainterHighQualityEnabler hq(p);
+						p.drawEllipse(inner);
+					}
+
+					p.setOpacity(radialOpacity);
+					auto icon = ([loaded, this, selected] {
+						if (loaded || activeLoading()) {
+							return &(selected ? st::historyFileThumbCancelSelected : st::historyFileThumbCancel);
+						}
+						return &(selected ? st::historyFileThumbDownloadSelected : st::historyFileThumbDownload);
+					})();
+					icon->paintInCenter(p, inner);
+					if (radial) {
+						p.setOpacity(1);
+
+						QRect rinner(inner.marginsRemoved(QMargins(st::msgFileRadialLine, st::msgFileRadialLine, st::msgFileRadialLine, st::msgFileRadialLine)));
+						_radial->draw(p, rinner, st::msgFileRadialLine, selected ? st::historyFileThumbRadialFgSelected : st::historyFileThumbRadialFg);
+					}
+				}
+			}
+		}
+		const auto checkDelta = _st.fileThumbSize - st::overviewSmallCheck.size;
+		paintCheckbox(p, { checkDelta, checkDelta }, selected, context);
+		return;
 	} else {
 		nameleft = _st.fileThumbSize + _st.filePadding.right();
 		nametop = st::linksBorder + _st.fileNameTop;

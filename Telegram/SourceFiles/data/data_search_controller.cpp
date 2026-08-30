@@ -55,6 +55,8 @@ MTPMessagesFilter PrepareSearchFilter(Storage::SharedMediaType type) {
 		return MTP_inputMessagesFilterPinned();
 	case Type::Poll:
 		return MTP_inputMessagesFilterPoll();
+	case Type::FilesPhotos:
+		return MTP_inputMessagesFilterDocument();
 	}
 	return MTP_inputMessagesFilterEmpty();
 }

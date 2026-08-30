@@ -26,6 +26,7 @@ enum class MediaFilter {
 	All,
 	Photos,
 	Videos,
+	Files,
 };
 
 class Memento;
@@ -183,6 +184,9 @@ public:
 	virtual void setSearchQuery(QString query) = 0;
 	virtual void jumpToMessage(MsgId messageId, Fn<void(FullMsgId)>) = 0;
 
+	[[nodiscard]] virtual MediaFilter mediaFilter() const {
+		return MediaFilter::All;
+	}
 	virtual void setMediaFilter(MediaFilter filter) {
 	}
 	[[nodiscard]] virtual bool supportsMediaFilter() const {

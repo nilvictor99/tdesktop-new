@@ -217,7 +217,8 @@ FullMsgId Key::reactionsContextId() const {
 	return FullMsgId();
 }
 
-rpl::producer<SparseIdsMergedSlice> AbstractController::mediaSource(
+rpl::producer<SparseIdsMergedSlice> AbstractController::mediaSourceOfType(
+		Storage::SharedMediaType type,
 		SparseIdsMergedSlice::UniversalMsgId aroundId,
 		int limitBefore,
 		int limitAfter) const {
@@ -249,9 +250,16 @@ rpl::producer<SparseIdsMergedSlice> AbstractController::mediaSource(
 				sublist() ? sublist()->sublistPeer()->id : PeerId(),
 				migratedPeerId(),
 				aroundId),
-			section().mediaType()),
+			type),
 		limitBefore,
 		limitAfter);
+}
+
+rpl::producer<SparseIdsMergedSlice> AbstractController::mediaSource(
+		SparseIdsMergedSlice::UniversalMsgId aroundId,
+		int limitBefore,
+		int limitAfter) const {
+	return mediaSourceOfType(section().mediaType(), aroundId, limitBefore, limitAfter);
 }
 
 rpl::producer<QString> AbstractController::mediaSourceQueryValue() const {

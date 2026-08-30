@@ -14,6 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/statistics/info_statistics_tag.h"
 #include "info/stories/info_stories_common.h"
 #include "window/window_session_controller.h"
+#include "storage/storage_shared_media.h"
 
 namespace Api {
 struct WhoReadList;
@@ -281,6 +282,12 @@ public:
 		return nullptr;
 	}
 	virtual rpl::producer<SparseIdsMergedSlice> mediaSource(
+		SparseIdsMergedSlice::UniversalMsgId aroundId,
+		int limitBefore,
+		int limitAfter) const;
+
+	rpl::producer<SparseIdsMergedSlice> mediaSourceOfType(
+		Storage::SharedMediaType type,
 		SparseIdsMergedSlice::UniversalMsgId aroundId,
 		int limitBefore,
 		int limitAfter) const;

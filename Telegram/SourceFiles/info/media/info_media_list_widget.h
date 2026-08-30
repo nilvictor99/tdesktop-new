@@ -101,8 +101,12 @@ public:
 	[[nodiscard]] bool canZoomIn() const;
 	[[nodiscard]] bool canZoomOut() const;
 
+	[[nodiscard]] MediaFilter mediaFilter() const {
+		return _provider->mediaFilter();
+	}
 	void setMediaFilter(MediaFilter filter);
 	[[nodiscard]] bool supportsMediaFilter() const;
+	void setFileGridColumns(int columns);
 
 	// Overview::Layout::Delegate
 	void registerHeavyItem(not_null<const BaseLayout*> item) override;
@@ -313,6 +317,8 @@ private:
 		Qt::MouseButton button);
 	void mouseActionCancel();
 	void performDrag();
+	void updateAutoScroll();
+	void autoScrollStep();
 	[[nodiscard]] style::cursor computeMouseCursor() const;
 	void showContextMenu(
 		QContextMenuEvent *e,
@@ -355,11 +361,14 @@ private:
 	base::flat_set<not_null<const BaseLayout*>> _heavyLayouts;
 	bool _heavyLayoutsInvalidated = false;
 	std::vector<Section> _sections;
+	int _fileGridColumns = 0;
 	Ui::RowsScrollCache _rowsScrollCache;
 
 	int _visibleTop = 0;
 	int _visibleBottom = 0;
 	ListScrollTopState _scrollTopState;
+	base::Timer _autoScrollTimer;
+	bool _autoScrollActive = false;
 	rpl::event_stream<int> _scrollToRequests;
 
 	std::unique_ptr<ListZoom> _zoom;

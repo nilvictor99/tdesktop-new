@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "info/media/info_media_common.h"
 #include "ui/rp_widget.h"
 #include "ui/widgets/scroll_area.h"
 #include "base/unique_qptr.h"
@@ -81,11 +82,13 @@ private:
 
 	void setupMediaFilter();
 	[[nodiscard]] bool supportsMediaFilter() const;
+	void setupFileViewToggle();
 
 	const not_null<Controller*> _controller;
 
 	object_ptr<Ui::VerticalLayout> _otherTypes = { nullptr };
 	object_ptr<Ui::SettingsSlider> _filter = { nullptr };
+	object_ptr<Ui::SettingsSlider> _rows = { nullptr };
 	object_ptr<ListWidget> _list = { nullptr };
 	object_ptr<EmptyWidget> _empty;
 
