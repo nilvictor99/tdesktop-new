@@ -449,6 +449,7 @@ void ListSection::resizeToWidth(int newWidth) {
 	};
 	switch (_type) {
 	case Type::FilesPhotos:
+	case Type::All:
 	case Type::Photo:
 	case Type::Video:
 	case Type::PhotoVideo:
@@ -506,6 +507,7 @@ int ListSection::recountHeight() {
 
 	switch (_type) {
 	case Type::FilesPhotos:
+	case Type::All:
 	case Type::Photo:
 	case Type::Video:
 	case Type::PhotoVideo:

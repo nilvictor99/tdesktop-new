@@ -33,12 +33,16 @@ bool IsItemGoodForType(const not_null<HistoryItem*> item, Type type) {
 	const auto photoType = (type == Type::Photo);
 	const auto photoVideoType = (type == Type::PhotoVideo);
 	const auto filesPhotosType = (type == Type::FilesPhotos);
-	if ((photoType || photoVideoType || filesPhotosType) && photo) {
+	const auto allType = (type == Type::All);
+	if ((photoType || photoVideoType || filesPhotosType || allType) && photo) {
 		return true;
 	}
 
 	const auto document = media->document();
 	if (!document) {
+		return false;
+	}
+	if (allType && document->sticker()) {
 		return false;
 	}
 	const auto voiceType = (type == Type::VoiceFile);
@@ -64,8 +68,8 @@ bool IsItemGoodForType(const not_null<HistoryItem*> item, Type type) {
 		|| (roundType && roundDoc)
 		|| (voiceRoundType && (roundDoc || voiceDoc))
 		|| (gifType && gifDoc)
-		|| ((videoType || photoVideoType) && videoDoc)
-		|| ((fileType || filesPhotosType) && (document->isTheme()
+		|| ((videoType || photoVideoType || allType) && videoDoc)
+		|| ((fileType || filesPhotosType || allType) && (document->isTheme()
 			|| document->isImage()
 			|| !document->canBeStreamed()));
 }

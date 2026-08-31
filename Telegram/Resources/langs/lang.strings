@@ -1893,6 +1893,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_media_type_songs" = "Audio files";
 "lng_media_type_files" = "Files";
 "lng_media_type_photos_files" = "Photos & Files";
+"lng_media_type_all" = "All";
+"lng_profile_all#one" = "{count} media item";
+"lng_profile_all#other" = "{count} media items";
+"lng_media_all_empty" = "No media here yet";
 "lng_profile_photos_files#one" = "{count} photo/file";
 "lng_profile_photos_files#other" = "{count} photos/files";
 "lng_media_photos_files_empty" = "No photos or files here yet";

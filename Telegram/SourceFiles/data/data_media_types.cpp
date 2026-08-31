@@ -892,7 +892,8 @@ Storage::SharedMediaTypesMask MediaPhoto::sharedMediaTypes() const {
 	return Storage::SharedMediaTypesMask{}
 		.added(Type::Photo)
 		.added(Type::PhotoVideo)
-		.added(Type::FilesPhotos);
+		.added(Type::FilesPhotos)
+		.added(Type::All);
 }
 
 bool MediaPhoto::canBeGrouped() const {
@@ -1128,7 +1129,8 @@ Storage::SharedMediaTypesMask MediaFile::sharedMediaTypes() const {
 	} else if (_document->isVideoFile()) {
 		return Storage::SharedMediaTypesMask{}
 			.added(Type::Video)
-			.added(Type::PhotoVideo);
+			.added(Type::PhotoVideo)
+			.added(Type::All);
 	} else if (_document->isVoiceMessage()) {
 		return Storage::SharedMediaTypesMask{}
 			.added(Type::VoiceFile)
@@ -1138,7 +1140,8 @@ Storage::SharedMediaTypesMask MediaFile::sharedMediaTypes() const {
 	}
 	return Storage::SharedMediaTypesMask{}
 		.added(Type::File)
-		.added(Type::FilesPhotos);
+		.added(Type::FilesPhotos)
+		.added(Type::All);
 }
 
 bool MediaFile::canBeGrouped() const {

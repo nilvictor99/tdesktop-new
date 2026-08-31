@@ -132,6 +132,7 @@ bool Provider::sectionHasFloatingHeader() {
 	switch (_type) {
 	case Type::Photo:
 	case Type::FilesPhotos:
+	case Type::All:
 	case Type::GIF:
 	case Type::Video:
 	case Type::PhotoVideo:
@@ -150,6 +151,7 @@ QString Provider::sectionTitle(not_null<const BaseLayout*> item) {
 	switch (_type) {
 	case Type::Photo:
 	case Type::FilesPhotos:
+	case Type::All:
 	case Type::GIF:
 	case Type::Video:
 	case Type::PhotoVideo:
@@ -176,6 +178,7 @@ bool Provider::sectionItemBelongsHere(
 	switch (_type) {
 	case Type::Photo:
 	case Type::FilesPhotos:
+	case Type::All:
 	case Type::GIF:
 	case Type::Video:
 	case Type::PhotoVideo:
@@ -566,6 +569,27 @@ std::unique_ptr<BaseLayout> Provider::createLayout(
 				photo,
 				options());
 		} else if (const auto file = getFile()) {
+			return std::make_unique<Document>(
+				delegate,
+				item,
+				DocumentFields{
+					.document = file,
+					.hideName = true,
+				},
+				songSt);
+		}
+		return nullptr;
+	case Type::All:
+		if (const auto photo = getPhoto()) {
+			return std::make_unique<Photo>(
+				delegate,
+				item,
+				photo,
+				options());
+		} else if (const auto file = getFile()) {
+			if (file->isVideoFile()) {
+				return std::make_unique<Video>(delegate, item, file, options());
+			}
 			return std::make_unique<Document>(
 				delegate,
 				item,

@@ -610,6 +610,15 @@ rpl::producer<int> SharedMediaCountValue(
 			return photos + files;
 		});
 	}
+	if (type == Type::All) {
+		return rpl::combine(
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Photo),
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Video),
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::File)
+		) | rpl::map([](int photos, int videos, int files) {
+			return photos + videos + files;
+		});
+	}
 	auto aroundId = 0;
 	auto limit = 0;
 	auto updated = SharedMediaMergedViewer(

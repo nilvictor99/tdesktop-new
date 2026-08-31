@@ -29,6 +29,7 @@ enum class SharedMediaType : signed char {
 	Pinned,
 	Poll,
 	FilesPhotos,
+	All,
 
 	kCount,
 };
