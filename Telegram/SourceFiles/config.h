@@ -10,7 +10,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "settings.h"
 
 enum {
-	MaxSelectedItems = 100,
+	// Límite de mensajes seleccionables a la vez. Subido de 100 a 10000 para
+	// permitir reenvíos masivos sin límites prácticos (1000+, 5000+, etc.).
+	// El reenvío en sí no tiene límite total (ApiWrap::forwardMessages trocea
+	// todo lo seleccionado en lotes de 100 y los procesa en cadena hasta
+	// terminar). El tope solo protege la UI frente a selecciones patológicas.
+	MaxSelectedItems = 10000,
 
 	LocalEncryptIterCount = 4000, // key derivation iteration count
 	LocalEncryptNoPwdIterCount = 4, // key derivation iteration count without pwd (not secure anyway)

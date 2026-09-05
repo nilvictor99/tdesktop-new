@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/data_sparse_ids.h"
 
+#include "debug_depurador.h"
 #include <rpl/combine.h>
 #include "storage/storage_sparse_ids_list.h"
 
@@ -179,6 +180,18 @@ bool SparseIdsSliceBuilder::applyUpdate(
 				_ids.front(),
 				_ids.back()
 			}));
+	// Para las slices compuestas (Fotos+Archivos / Todo) cada actualización
+	// trae la UNION de varias secuencias de servidor (p.ej. Photo+File). La
+	// primera página que llega ya cubre un rango ancho y las siguientes NO
+	// intersectan el estado visible actual, por lo que sin este forzado el
+	// builder descartaría sus ids (`needMergeMessages=false`), `_ids` no
+	// crecería, el msgId de la petición "Before" nunca avanzaría y el loader
+	// entraría en un bucle infinito re-pidiendo la misma página sin cargar
+	// el resto del contenido. Forzamos el merge de los ids recibidos (el
+	// `base::flat_set::merge` es idempotente, no duplica), de modo que la
+	// slice acumula todas las páginas y explora el historial completo. No
+	// afecta a Media/Archivos (cuya secuencia es contigua y ya intersecta).
+	needMergeMessages = needMergeMessages || (update.messages != nullptr);
 	if (!needMergeMessages && !update.count) {
 		return false;
 	}
@@ -195,6 +208,21 @@ bool SparseIdsSliceBuilder::applyUpdate(
 			: base::flat_set<MsgId> {},
 		skippedBefore,
 		skippedAfter);
+	// Traza del borde del builder DESPUÉS del merge: muestra cuántos ids tiene
+	// _ids, sus extremos y cómo quedan los skipped. Sirve para comparar Media
+	// (que cierra en 0/0) con FilesPhotos/All (para ver por qué no cierran).
+	Depur::append(
+		QStringLiteral("[DEPUR] SPARSE applied range=%1..%2 items=%3 "
+			"ids=%4 f=%5..%6 skipB=%7 skipA=%8 count=%9")
+		.arg(Depur::num(update.range.from.bare))
+		.arg(Depur::num(update.range.till.bare))
+		.arg(update.messages ? Depur::num(update.messages->size()) : QStringLiteral("n/a"))
+		.arg(Depur::num(_ids.size()))
+		.arg(_ids.empty() ? QStringLiteral("-") : Depur::num(_ids.front().bare))
+		.arg(_ids.empty() ? QStringLiteral("-") : Depur::num(_ids.back().bare))
+		.arg(_skippedBefore.has_value() ? Depur::num(*_skippedBefore) : QStringLiteral("?"))
+		.arg(_skippedAfter.has_value() ? Depur::num(*_skippedAfter) : QStringLiteral("?"))
+		.arg(update.count.has_value() ? Depur::num(*update.count) : QStringLiteral("n/a")));
 	return true;
 }
 

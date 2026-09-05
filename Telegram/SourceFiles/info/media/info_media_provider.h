@@ -85,6 +85,17 @@ public:
 private:
 	static constexpr auto kMinimalIdsLimit = 16;
 	static constexpr auto kDefaultAroundId = (ServerMaxMsgId - 1);
+	// Para FilesPhotos/All pedimos y materializamos una ventana grande de
+	// entrada (en vez de arrancar en 16), de modo que el módulo compuesto
+	// muestre todo su contenido sin huecos ni límites visibles, igual que el
+	// módulo Media. La materialización por lotes de Ronda 18 ya hace seguro
+	// procesar esta ventana sin superar el límite de ids por petición del API.
+	// Subido a 1000 (window ≈ 2000 ids): en la unión, SparseIdsSliceBuilder poda
+	// la slice a limitBefore+limitAfter alrededor del around; una ventana
+	// pequeña recortaba el front y la petición "Before" no avanzaba hacia el
+	// inicio real (el log mostraba skipBefore≈13000 sin bajar), dejando archivos
+	// antiguos sin mostrar. Con esta ventana el front avanza mucho más por página.
+	static constexpr auto kFullIdsLimit = 1000;
 
 	bool sectionHasFloatingHeader() override;
 	QString sectionTitle(not_null<const BaseLayout*> item) override;
@@ -107,6 +118,7 @@ private:
 	[[nodiscard]] SparseIdsMergedSlice::Key sliceKey(
 		UniversalMsgId universalId) const;
 
+	void requestMissingAround(UniversalMsgId universalId);
 	void itemRemoved(not_null<const HistoryItem*> item);
 	void markLayoutsStale();
 	void clearStaleLayouts();
@@ -123,6 +135,25 @@ private:
 	UniversalMsgId _universalAroundId = kDefaultAroundId;
 	int _idsLimit = kMinimalIdsLimit;
 	SparseIdsMergedSlice _slice;
+
+	// Advanced self-healing for composite types (FilesPhotos/All): a slice may
+	// contain universal ids whose HistoryItem is not materialized in memory
+	// (large channels, or the History was unloaded elsewhere). Instead of
+	// re-requesting a single composite search around one id (slow, one gap at a
+	// time), we collect every un-materialized id of the current slice and
+	// materialize them all at once through api().requestMessageData() (which
+	// batches the ids into messages.getMessages/channels.getMessages). When all
+	// the responses arrive we rebuild, so the whole visible region fills in a
+	// single pass. Guarded: one materialization pass in flight at a time
+	// (cleared when the materialized responses arrive).
+	bool _missingRequested = false;
+	// Cuenta cuántas pasadas de materialización seguidas hemos hecho para
+	// llenar ids que siguen sin HistoryItem. Se limita para no reintentar en
+	// bucle infinito cuando un id no existe de verdad (p.ej. borrado). Con la
+	// materialización proactiva de la ventana grande (8-10 lotes por slice en
+	// canales grandes) damos varias pasadas para tolerar fallos transitorios.
+	int _missingRetries = 0;
+	static constexpr int kMaxMissingRetries = 8;
 
 	std::unordered_map<UniversalMsgId, CachedItem> _layouts;
 	rpl::event_stream<not_null<BaseLayout*>> _layoutRemoved;

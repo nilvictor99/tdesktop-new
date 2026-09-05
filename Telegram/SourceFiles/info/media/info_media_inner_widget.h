@@ -13,6 +13,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/unique_qptr.h"
 #include "info/media/info_media_widget.h"
 #include "info/media/info_media_list_widget.h"
+#include <rpl/lifetime.h>
+#include <vector>
 
 namespace Ui {
 class VerticalLayout;
@@ -82,6 +84,7 @@ private:
 
 	void setupMediaFilter();
 	[[nodiscard]] bool supportsMediaFilter() const;
+	void rebuildMediaFilter(const std::vector<MediaFilter> &sections);
 	void setupFileViewToggle();
 
 	const not_null<Controller*> _controller;
@@ -91,6 +94,9 @@ private:
 	object_ptr<Ui::SettingsSlider> _rows = { nullptr };
 	object_ptr<ListWidget> _list = { nullptr };
 	object_ptr<EmptyWidget> _empty;
+
+	std::vector<MediaFilter> _filterSections;
+	rpl::lifetime _filterCountsLifetime;
 
 	bool _inResize = false;
 	bool _isStackBottom = false;
