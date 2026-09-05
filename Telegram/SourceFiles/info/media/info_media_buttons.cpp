@@ -92,6 +92,7 @@ tr::phrase<lngtag_count> MediaTextPhrase(Type type) {
 	case Type::GIF: return tr::lng_profile_gifs;
 	case Type::Video: return tr::lng_profile_videos;
 	case Type::FilesPhotos: return tr::lng_profile_photos_files;
+	case Type::All: return tr::lng_profile_all;
 	case Type::File: return tr::lng_profile_files;
 	case Type::MusicFile: return tr::lng_profile_songs;
 	case Type::Link: return tr::lng_profile_shared_links;

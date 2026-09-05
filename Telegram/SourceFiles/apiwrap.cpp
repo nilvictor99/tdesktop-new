@@ -7,6 +7,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "apiwrap.h"
 
+#include <functional>
+
+#include "debug_depurador.h"
 #include "api/api_authorizations.h"
 #include "api/api_attached_stickers.h"
 #include "api/api_blocked_peers.h"
@@ -3633,7 +3636,27 @@ void ApiWrap::requestSharedMedia(
 	}
 
 	if (type == SharedMediaType::FilesPhotos) {
+		Depur::append(
+			QStringLiteral("[DEPUR] FP REQUEST peer=%1 msgId=%2 slice=%3")
+			.arg(Depur::num(peer->id.value))
+			.arg(Depur::num(messageId.bare))
+			.arg(int(slice)));
 		requestSharedMediaFilesPhotos(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			messageId,
+			slice);
+		return;
+	}
+
+	if (type == SharedMediaType::All) {
+		Depur::append(
+			QStringLiteral("[DEPUR] ALL REQUEST peer=%1 msgId=%2 slice=%3")
+			.arg(Depur::num(peer->id.value))
+			.arg(Depur::num(messageId.bare))
+			.arg(int(slice)));
+		requestSharedMediaAll(
 			peer,
 			topicRootId,
 			monoforumPeerId,
@@ -3689,7 +3712,7 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 		PeerId monoforumPeerId,
 		MsgId messageId,
 		SliceType slice) {
-	const auto key = 	SharedMediaRequest{
+	const auto key = SharedMediaRequest{
 		peer,
 		topicRootId,
 		monoforumPeerId,
@@ -3697,14 +3720,13 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 		messageId,
 		slice,
 	};
-	LOG(("[FILESPHOTOS] request msg=%1 slice=%2")
-		.arg(qint64(messageId.bare))
-		.arg(int(slice)));
 	_sharedMediaRequests.emplace(key);
 
 	struct State {
 		std::optional<Api::SearchResult> photo;
 		std::optional<Api::SearchResult> file;
+		bool photoOk = false;
+		bool fileOk = false;
 	};
 	const auto state = std::make_shared<State>();
 
@@ -3720,6 +3742,7 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 		}
 		_sharedMediaRequests.remove(key);
 		Expects(state->photo.has_value() && state->file.has_value());
+		const auto allOk = state->photoOk && state->fileOk;
 		auto merged = Api::SearchResult();
 		auto mergeOne = [&](const Api::SearchResult &parsed) {
 			merged.fullCount += parsed.fullCount;
@@ -3735,33 +3758,64 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 				merged.messageIds.begin(),
 				merged.messageIds.end());
 			// FilesPhotos es la UNION de dos secuencias de servidor (Photo+File).
-			// Un solo noSkipRange por lote no puede representar "contiguo" sobre
-			// esa unión; para que el sparse-loader acumule todas las páginas en
-			// UNA slice creciente (y así explore hacia atrás como Media), forzamos
-			// el limite superior al mensaje más nuevo.
+			// Antes se forzaba till=ServerMaxMsgId para que el sparse-loader
+			// acumulara todas las páginas en UNA slice, pero ese "tope fantasma"
+			// hacía que el loader creyera que ya abarcaba hasta el mensaje más
+			// nuevo y dejara de pedir hacia abajo (cortaba la lista). Ahora
+			// usamos el rango REAL del lote (min..max de los ids devueltos), de
+			// modo que el loader siga pidiendo las páginas vecinas hasta cubrir
+			// todo el historial.
 			merged.noSkipRange = MsgRange{
 				*minmax.first,
-				ServerMaxMsgId
+				*minmax.second
 			};
+		} else if (!allOk) {
+			// Al menos una búsqueda falló (p.ej. PEER_ID_INVALID / error de red):
+			// el fin de la dirección NO está probado. Omitimos la actualización
+			// para que el sparse-loader no congele la exploración con un falso
+			// "fin de lista" (noSkipRange {0,0}) y siga re-pidiendo la cadena al
+			// próximo disparo (scroll / cambio de datos), igual que el camino
+			// oficial (que descarta el fallo sin tocar el estado).
+			Depur::append(
+				QStringLiteral("[DEPUR] FP MERGE-SKIP items=0 allOk=0 "
+					"(fallo: no se marca fin de lista)"));
+			return;
 		} else {
-			// Lote vacío: propagar el rango de "fin de dirección" ya resuelto por
-			// ParseSearchResult, para que el loader deje de pedir (evita bucles).
-			merged.noSkipRange = MsgRange{
-				qMin(
-					state->photo->noSkipRange.from,
-					state->file->noSkipRange.from),
-				qMax(
-					state->photo->noSkipRange.till,
-					state->file->noSkipRange.till)
-			};
+			// Lote vacío pero búsquedas OK. Distinguimos el FIN REAL del
+			// historial (todas las sub-búsquedas llegaron a su inicio, msgId
+			// mínimo de servidor) del caso en que el servidor aún no devolvió
+			// resultados porque la exploración no llegó al tope. Si aún no se
+			// alcanzó el inicio, NO cerramos: omitimos la actualización para
+			// que el loader siga pidiendo las páginas anteriores (evita que
+			// SparseIdsSliceBuilder marque skippedBefore=0 y "corte" la lista
+			// antes de mostrar todo el contenido).
+			const auto federalFrom = qMin(
+				state->photo->noSkipRange.from,
+				state->file->noSkipRange.from);
+			const auto federalTill = qMax(
+				state->photo->noSkipRange.till,
+				state->file->noSkipRange.till);
+			// Los id de mensajes de servidor parten de ~2; un from así de bajo
+			// significa "se llegó al principio del historial".
+			constexpr auto kMinServerMsgId = 2;
+			if (federalFrom > kMinServerMsgId) {
+				Depur::append(
+					QStringLiteral("[DEPUR] FP MERGE-SKIP items=0 from=%1 "
+						"(aún no es el inicio; se sigue explorando)")
+					.arg(Depur::num(federalFrom.bare)));
+				return;
+			}
+			// Fin real: propagar el rango para que el loader cierre de forma
+			// limpia, sin sobreescribir el fullCount de la unión.
+			merged.noSkipRange = MsgRange{ federalFrom, federalTill };
 		}
-		LOG(("[FILESPHOTOS] merge msg=%1 slice=%2 n=%3 full=%4 range=%5..%6")
-			.arg(qint64(messageId.bare))
-			.arg(int(slice))
-			.arg(qint64(merged.messageIds.size()))
-			.arg(merged.fullCount)
-			.arg(qint64(merged.noSkipRange.from.bare))
-			.arg(qint64(merged.noSkipRange.till.bare)));
+		Depur::append(
+			QStringLiteral("[DEPUR] FP APPLY items=%1 count=%2 nsk=%3..%4 allOk=%5")
+			.arg(Depur::num(merged.messageIds.size()))
+			.arg(Depur::num(merged.fullCount))
+			.arg(Depur::num(merged.noSkipRange.from.bare))
+			.arg(Depur::num(merged.noSkipRange.till.bare))
+			.arg(allOk ? 1 : 0));
 		sharedMediaDone(
 			peer,
 			topicRootId,
@@ -3785,11 +3839,30 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 			}
 			return &state->file;
 		}();
+		const auto okFlag = [&]() -> bool* {
+			if (type == SharedMediaType::Photo) {
+				return &state->photoOk;
+			}
+			return &state->fileOk;
+		}();
+		const auto typeName = [&]() -> QString {
+			if (type == SharedMediaType::Photo) {
+				return u"Photo"_q;
+			}
+			return u"File"_q;
+		}();
 		if (!prepared) {
 			*captured = Api::SearchResult();
+			Depur::append(
+				QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3 "
+					"NO-PREPARADO").arg(typeName).arg(Depur::num(messageId.bare))
+				.arg(int(slice)));
 			finishOne();
 			return;
 		}
+		Depur::append(
+			QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3")
+			.arg(typeName).arg(Depur::num(messageId.bare)).arg(int(slice)));
 		historiesPtr->sendRequest(history, requestType, [=](Fn<void()> finish) {
 			return request(std::move(*prepared)
 			).done([=](const Api::SearchRequestResult &result) {
@@ -3799,10 +3872,24 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 					messageId,
 					slice,
 					result);
+				*okFlag = true;
+				Depur::append(
+					QStringLiteral("[DEPUR] FP DONE type=%1 items=%2 nsk=%3..%4 "
+						"fullCount=%5").arg(typeName)
+					.arg(Depur::num((*captured)->messageIds.size()))
+					.arg(Depur::num((*captured)->noSkipRange.from.bare))
+					.arg(Depur::num((*captured)->noSkipRange.till.bare))
+					.arg(Depur::num((*captured)->fullCount)));
 				finishOne();
 				finish();
-			}).fail([=] {
+			}).fail([=](const MTP::Error &error, mtpRequestId requestId) {
 				*captured = Api::SearchResult();
+				Depur::append(
+					QStringLiteral("[DEPUR] FP FAIL type=%1 req=%2 err=%3 "
+						"code=%4").arg(typeName)
+					.arg(Depur::num(requestId))
+					.arg(error.type())
+					.arg(Depur::num(error.code())));
 				finishOne();
 				finish();
 			}).send();
@@ -3810,6 +3897,217 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 	};
 
 	sendOne(SharedMediaType::Photo);
+	sendOne(SharedMediaType::File);
+}
+
+void ApiWrap::requestSharedMediaAll(
+		not_null<PeerData*> peer,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		MsgId messageId,
+		SliceType slice) {
+	const auto key = SharedMediaRequest{
+		peer,
+		topicRootId,
+		monoforumPeerId,
+		SharedMediaType::All,
+		messageId,
+		slice,
+	};
+	_sharedMediaRequests.emplace(key);
+
+	struct State {
+		std::optional<Api::SearchResult> photo;
+		std::optional<Api::SearchResult> video;
+		std::optional<Api::SearchResult> file;
+		bool photoOk = false;
+		bool videoOk = false;
+		bool fileOk = false;
+	};
+	const auto state = std::make_shared<State>();
+
+	const auto history = _session->data().history(peer);
+	auto &histories = history->owner().histories();
+	const auto historiesPtr = &histories;
+	const auto requestType = Data::Histories::RequestType::History;
+
+	auto doneCount = std::make_shared<int>(0);
+	const auto finishOne = [=] {
+		if (++*doneCount < 3) {
+			return;
+		}
+		_sharedMediaRequests.remove(key);
+		Expects(
+			state->photo.has_value()
+			&& state->video.has_value()
+			&& state->file.has_value());
+		const auto allOk = state->photoOk && state->videoOk && state->fileOk;
+		auto merged = Api::SearchResult();
+		auto mergeOne = [&](const Api::SearchResult &parsed) {
+			merged.fullCount += parsed.fullCount;
+			merged.messageIds.insert(
+				merged.messageIds.end(),
+				parsed.messageIds.begin(),
+				parsed.messageIds.end());
+		};
+		mergeOne(*state->photo);
+		mergeOne(*state->video);
+		mergeOne(*state->file);
+		if (!merged.messageIds.empty()) {
+			const auto minmax = std::minmax_element(
+				merged.messageIds.begin(),
+				merged.messageIds.end());
+			// All es la UNION de tres secuencias de servidor (Photo+Video+File).
+			// Antes se forzaba till=ServerMaxMsgId para que el sparse-loader
+			// acumulara todas las páginas en UNA slice, pero ese "tope fantasma"
+			// hacía que el loader creyera que ya abarcaba hasta el mensaje más
+			// nuevo y dejara de pedir hacia abajo (cortaba la lista). Ahora
+			// usamos el rango REAL del lote (min..max de los ids devueltos), de
+			// modo que el loader siga pidiendo las páginas vecinas hasta cubrir
+			// todo el historial.
+			merged.noSkipRange = MsgRange{
+				*minmax.first,
+				*minmax.second
+			};
+		} else if (!allOk) {
+			// Al menos una búsqueda falló (p.ej. PEER_ID_INVALID / error de red):
+			// el fin de la dirección NO está probado. Omitimos la actualización
+			// para que el sparse-loader no congele la exploración con un falso
+			// "fin de lista" (noSkipRange {0,0}) y siga re-pidiendo la cadena al
+			// próximo disparo (scroll / cambio de datos), igual que el camino
+			// oficial (que descarta el fallo sin tocar el estado).
+			Depur::append(
+				QStringLiteral("[DEPUR] ALL MERGE-SKIP items=0 allOk=0 "
+					"(fallo: no se marca fin de lista)"));
+			return;
+		} else {
+			// Lote vacío pero búsquedas OK. Distinguimos el FIN REAL del
+			// historial (todas las sub-búsquedas llegaron a su inicio, msgId
+			// mínimo de servidor) del caso en que el servidor aún no devolvió
+			// resultados porque la exploración no llegó al tope. Si aún no se
+			// alcanzó el inicio, NO cerramos: omitimos la actualización para
+			// que el loader siga pidiendo las páginas anteriores (evita que
+			// SparseIdsSliceBuilder marque skippedBefore=0 y "corte" la lista
+			// antes de mostrar todo el contenido).
+			const auto federalFrom = qMin(
+				state->photo->noSkipRange.from,
+				qMin(
+					state->video->noSkipRange.from,
+					state->file->noSkipRange.from));
+			const auto federalTill = qMax(
+				state->photo->noSkipRange.till,
+				qMax(
+					state->video->noSkipRange.till,
+					state->file->noSkipRange.till));
+			// Los id de mensajes de servidor parten de ~2; un from así de bajo
+			// significa "se llegó al principio del historial".
+			constexpr auto kMinServerMsgId = 2;
+			if (federalFrom > kMinServerMsgId) {
+				Depur::append(
+					QStringLiteral("[DEPUR] ALL MERGE-SKIP items=0 from=%1 "
+						"(aún no es el inicio; se sigue explorando)")
+					.arg(Depur::num(federalFrom.bare)));
+				return;
+			}
+			// Fin real: propagar el rango para que el loader cierre de forma
+			// limpia, sin sobreescribir el fullCount de la unión.
+			merged.noSkipRange = MsgRange{ federalFrom, federalTill };
+		}
+		Depur::append(
+			QStringLiteral("[DEPUR] ALL APPLY items=%1 count=%2 nsk=%3..%4 allOk=%5")
+			.arg(Depur::num(merged.messageIds.size()))
+			.arg(Depur::num(merged.fullCount))
+			.arg(Depur::num(merged.noSkipRange.from.bare))
+			.arg(Depur::num(merged.noSkipRange.till.bare))
+			.arg(allOk ? 1 : 0));
+		sharedMediaDone(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			SharedMediaType::All,
+			std::move(merged));
+	};
+
+	const auto sendOne = [=](SharedMediaType type) {
+		const auto prepared = Api::PrepareSearchRequest(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			type,
+			QString(),
+			messageId,
+			slice);
+		const auto captured = [&]() -> std::optional<Api::SearchResult>* {
+			if (type == SharedMediaType::Photo) {
+				return &state->photo;
+			} else if (type == SharedMediaType::Video) {
+				return &state->video;
+			}
+			return &state->file;
+		}();
+		const auto okFlag = [&]() -> bool* {
+			if (type == SharedMediaType::Photo) {
+				return &state->photoOk;
+			} else if (type == SharedMediaType::Video) {
+				return &state->videoOk;
+			}
+			return &state->fileOk;
+		}();
+		const auto typeName = [&]() -> QString {
+			if (type == SharedMediaType::Photo) {
+				return u"Photo"_q;
+			} else if (type == SharedMediaType::Video) {
+				return u"Video"_q;
+			}
+			return u"File"_q;
+		}();
+		if (!prepared) {
+			*captured = Api::SearchResult();
+			Depur::append(
+				QStringLiteral("[DEPUR] ALL SEND type=%1 msgId=%2 slice=%3 "
+					"NO-PREPARADO").arg(typeName).arg(Depur::num(messageId.bare))
+				.arg(int(slice)));
+			finishOne();
+			return;
+		}
+		Depur::append(
+			QStringLiteral("[DEPUR] ALL SEND type=%1 msgId=%2 slice=%3")
+			.arg(typeName).arg(Depur::num(messageId.bare)).arg(int(slice)));
+		historiesPtr->sendRequest(history, requestType, [=](Fn<void()> finish) {
+			return request(std::move(*prepared)
+			).done([=](const Api::SearchRequestResult &result) {
+				*captured = Api::ParseSearchResult(
+					peer,
+					type,
+					messageId,
+					slice,
+					result);
+				*okFlag = true;
+				Depur::append(
+					QStringLiteral("[DEPUR] ALL DONE type=%1 items=%2 nsk=%3..%4 "
+						"fullCount=%5").arg(typeName)
+					.arg(Depur::num((*captured)->messageIds.size()))
+					.arg(Depur::num((*captured)->noSkipRange.from.bare))
+					.arg(Depur::num((*captured)->noSkipRange.till.bare))
+					.arg(Depur::num((*captured)->fullCount)));
+				finishOne();
+				finish();
+			}).fail([=](const MTP::Error &error, mtpRequestId requestId) {
+				*captured = Api::SearchResult();
+				Depur::append(
+					QStringLiteral("[DEPUR] ALL FAIL type=%1 req=%2 err=%3 "
+						"code=%4").arg(typeName)
+					.arg(Depur::num(requestId))
+					.arg(error.type())
+					.arg(Depur::num(error.code())));
+				finishOne();
+				finish();
+			}).send();
+		});
+	};
+
+	sendOne(SharedMediaType::Photo);
+	sendOne(SharedMediaType::Video);
 	sendOne(SharedMediaType::File);
 }
 
@@ -3825,12 +4123,6 @@ void ApiWrap::sharedMediaDone(
 		return;
 	}
 	const auto hasMessages = !parsed.messageIds.empty();
-	LOG(("[FILESPHOTOS] done type=%1 msg=%2 full=%3 range=%4..%5")
-		.arg(int(type))
-		.arg(qint64(parsed.messageIds.size()))
-		.arg(parsed.fullCount)
-		.arg(qint64(parsed.noSkipRange.from.bare))
-		.arg(qint64(parsed.noSkipRange.till.bare)));
 	_session->storage().add(Storage::SharedMediaAddSlice(
 		peer->id,
 		topicRootId,
@@ -4036,22 +4328,122 @@ void ApiWrap::forwardMessages(
 	}
 
 	auto forwardFrom = draft.items.front()->history()->peer;
-	auto ids = QVector<MTPint>();
-	auto randomIds = QVector<MTPlong>();
-	auto localIds = std::shared_ptr<base::flat_map<uint64, FullMsgId>>();
 
-	const auto sendAccumulated = [&] {
-		if (shared) {
-			++shared->requestsLeft;
+	// Construimos por adelantado TODOS los lotes del reenvío. El límite por
+	// petición de messages.forwardMessages es kMaxForwardMessages (100) ids,
+	// pero NO hay ningún límite en la cantidad total reenviada: todo lo
+	// seleccionado se trocea en lotes y la cadena los procesa todos hasta
+	// terminar.
+	struct ForwardChunk {
+		not_null<PeerData*> from;
+		QVector<MTPint> ids;
+		QVector<MTPlong> randomIds;
+		std::shared_ptr<base::flat_map<uint64, FullMsgId>> localIds;
+	};
+	auto chunks = std::vector<ForwardChunk>();
+	chunks.reserve(1 + count / kMaxForwardMessages);
+	{
+		auto ids = QVector<MTPint>();
+		auto randomIds = QVector<MTPlong>();
+		auto localIds = std::shared_ptr<base::flat_map<uint64, FullMsgId>>();
+		const auto flush = [&] {
+			if (ids.isEmpty()) {
+				return;
+			}
+			chunks.push_back(ForwardChunk{
+				.from = forwardFrom,
+				.ids = std::move(ids),
+				.randomIds = std::move(randomIds),
+				.localIds = std::move(localIds),
+			});
+			ids = QVector<MTPint>();
+			randomIds = QVector<MTPlong>();
+			localIds = nullptr;
+		};
+		ids.reserve(count);
+		randomIds.reserve(count);
+		for (const auto &item : draft.items) {
+			const auto randomId = base::RandomValue<uint64>();
+			if (genClientSideMessage) {
+				const auto newId = FullMsgId(
+					peer->id,
+					_session->data().nextLocalMessageId());
+				history->addNewLocalMessage({
+					.id = newId.msg,
+					.flags = flags,
+					.from = NewMessageFromId(action),
+					.replyTo = {
+						.topicRootId = topMsgId,
+						.monoforumPeerId = monoforumPeerId,
+					},
+					.date = NewMessageDate(action.options),
+					.shortcutId = action.options.shortcutId,
+					.starsPaid = action.options.starsApproved,
+					.postAuthor = NewMessagePostAuthor(action),
+					.suggest = HistoryMessageSuggestInfo(action.options),
+					// forwarded messages don't have effects
+					//.effectId = action.options.effectId,
+				}, item);
+				_session->data().registerMessageRandomId(randomId, newId);
+				if (!localIds) {
+					localIds = std::make_shared<base::flat_map<uint64, FullMsgId>>();
+				}
+				localIds->emplace(randomId, newId);
+			}
+			const auto newFrom = item->history()->peer;
+			if (forwardFrom != newFrom
+				|| ids.size() >= kMaxForwardMessages) {
+				flush();
+				forwardFrom = newFrom;
+			}
+			ids.push_back(MTP_int(item->id));
+			randomIds.push_back(MTP_long(randomId));
 		}
-		const auto idsCopy = localIds;
-		const auto scheduled = action.options.scheduled;
+		flush();
+	}
+
+	const auto scheduled = action.options.scheduled;
+	const auto starsLeft = std::make_shared<int>(action.options.starsApproved);
+	const auto nextIndex = std::make_shared<int>(0);
+
+	// Cadena de reenvío (estable, sin límite total y conservando la cronología):
+	// los lotes se envían de UNO en UNO — cada lote espera a que el anterior
+	// termine (con éxito o con fallo) antes de enviar el siguiente. De esta
+	// forma la cadena nunca se rompe:
+	//  - si un lote falla se reporta el error, pero se continúa reenviando el
+	//    resto hasta que se reenvía TODO lo seleccionado ("procesar hasta
+	//    terminar");
+	//  - el successCallback se dispara SIEMPRE al terminar el último lote,
+	//    aunque haya habido fallos (antes un fallo dejaba la cuenta pendiente
+	//    para siempre y la funcionalidad se quedaba colgada);
+	//  - con reenvíos de más de 1000 mensajes no se lanzan decenas de
+	//    peticiones a la vez (que provocaban flood y mensajes desordenados),
+	//    sino una sola en vuelo, manteniendo la cronología exacta y sin
+	//    sobrecargar la API.
+	// El callable recursivo de la cadena se guarda en un shared_ptr:
+	// capturarlo por valor copiaría la versión VACÍA inicial (invocar esa
+	// copia lanza std::bad_function_call -> abort y cierra la app al reenviar
+	// varios lotes), y capturarlo por referencia dejaría una referencia
+	// colgante al salir de forwardMessages. Con shared_ptr el estado vive
+	// mientras la cadena esté en vuelo y la recursión avanza de forma segura.
+	const auto sendNextChunk = std::make_shared<std::function<void()>>();
+	*sendNextChunk = [=, &histories] {
+		const auto index = (*nextIndex)++;
+		if (index >= int(chunks.size())) {
+			return;
+		}
+		const auto &chunk = chunks[index];
+		const auto idsCopy = chunk.localIds;
+		const auto fromId = chunk.from->id;
+		const auto fromInput = chunk.from->input();
+		const auto ids = chunk.ids;
+		const auto randomIds = chunk.randomIds;
 		const auto starsPaid = std::min(
-			action.options.starsApproved,
+			*starsLeft,
 			int(ids.size() * peer->starsPerMessageChecked()));
+		*starsLeft -= starsPaid;
 		auto oneFlags = sendFlags;
 		if (starsPaid) {
-			action.options.starsApproved -= starsPaid;
 			oneFlags |= SendFlag::f_allow_paid_stars;
 		}
 		auto buildMessage = [=](
@@ -4070,7 +4462,7 @@ void ApiWrap::forwardMessages(
 			}
 			return MTPmessages_ForwardMessages(
 				MTP_flags(flags),
-				forwardFrom->input(),
+				fromInput,
 				MTP_vector<MTPint>(ids),
 				MTP_vector<MTPlong>(randomIds),
 				history->peer->input(),
@@ -4094,6 +4486,29 @@ void ApiWrap::forwardMessages(
 				MTP_long(starsPaid),
 				Api::SuggestToMTP(action.options.suggest));
 		};
+		// Defensivo: solo se invoca un handler si realmente existe. Invocar
+		// un std::function vacío lanza std::bad_function_call (excepción no
+		// capturable en esta ruta), termina el proceso con abort() y cierra
+		// la app de forma inesperada al reenviar varios archivos a la vez.
+		const auto settle = [=] {
+			if (shared
+				&& !--shared->requestsLeft
+				&& shared->callback) {
+				shared->callback();
+			}
+			if (*nextIndex < int(chunks.size()) && *sendNextChunk) {
+				(*sendNextChunk)();
+			}
+		};
+		// Defensivo: si el peer de origen del lote se resuelve vacío (por
+		// ejemplo un usuario/canal cuyo acceso aún no está cargado), la API
+		// rechaza la petición con INPUT_PEERS_EMPTY. En lugar de enviar una
+		// petición inválida, se salta el lote y la cadena continúa reenviando
+		// el resto. Nunca se pierde la cuenta: se avanza al siguiente lote.
+		if (ids.isEmpty() || fromInput.type() == mtpc_inputPeerEmpty) {
+			settle();
+			return;
+		}
 		histories.sendPreparedMessage(
 			history,
 			FullReplyTo{ .topicRootId = topicRootId },
@@ -4104,16 +4519,14 @@ void ApiWrap::forwardMessages(
 					_session->api().updates().checkForSentToScheduled(
 						result);
 				}
-				if (shared && !--shared->requestsLeft) {
-					shared->callback();
-				}
 				if (peer->isSelf() && _session->premium()) {
 					ProcessRecentSelfForwards(
 						_session,
 						result,
 						peer->id,
-						forwardFrom->id);
+						fromId);
 				}
+				settle();
 			},
 			[=](const MTP::Error &error, const MTP::Response &) {
 				if (idsCopy) {
@@ -4127,53 +4540,16 @@ void ApiWrap::forwardMessages(
 				} else {
 					_session->api().sendMessageFail(error, peer);
 				}
+				// IMPORTANTE: un lote con fallo NO rompe la cadena. Se
+				// reporta el error y se continúa con el siguiente lote hasta
+				// reenviar todo lo seleccionado.
+				settle();
 			});
-
-		ids.resize(0);
-		randomIds.resize(0);
-		localIds = nullptr;
 	};
-
-	ids.reserve(count);
-	randomIds.reserve(count);
-	for (const auto &item : draft.items) {
-		const auto randomId = base::RandomValue<uint64>();
-		if (genClientSideMessage) {
-			const auto newId = FullMsgId(
-				peer->id,
-				_session->data().nextLocalMessageId());
-			history->addNewLocalMessage({
-				.id = newId.msg,
-				.flags = flags,
-				.from = NewMessageFromId(action),
-				.replyTo = {
-					.topicRootId = topMsgId,
-					.monoforumPeerId = monoforumPeerId,
-				},
-				.date = NewMessageDate(action.options),
-				.shortcutId = action.options.shortcutId,
-				.starsPaid = action.options.starsApproved,
-				.postAuthor = NewMessagePostAuthor(action),
-				.suggest = HistoryMessageSuggestInfo(action.options),
-				// forwarded messages don't have effects
-				//.effectId = action.options.effectId,
-			}, item);
-			_session->data().registerMessageRandomId(randomId, newId);
-			if (!localIds) {
-				localIds = std::make_shared<base::flat_map<uint64, FullMsgId>>();
-			}
-			localIds->emplace(randomId, newId);
-		}
-		const auto newFrom = item->history()->peer;
-		if (forwardFrom != newFrom
-			|| ids.size() >= kMaxForwardMessages) {
-			sendAccumulated();
-			forwardFrom = newFrom;
-		}
-		ids.push_back(MTP_int(item->id));
-		randomIds.push_back(MTP_long(randomId));
+	if (shared) {
+		shared->requestsLeft = int(chunks.size());
 	}
-	sendAccumulated();
+	(*sendNextChunk)();
 	_session->data().sendHistoryChangeNotifications();
 }
 

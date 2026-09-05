@@ -12,6 +12,60 @@ This is the complete source code and the build instructions for the official [Te
 
 The source code is published under GPLv3 with OpenSSL exception, the license is available [here][license].
 
+> **Build personalizada (fork).** Este árbol contiene modificaciones propias además
+> de la base oficial. Las funciones añadidas están resumidas abajo; el detalle
+> técnico y el seguimiento de cada ronda viven en `C:\Users\VICTOR\code\docs`
+> (`cambios.md`, `seguimiento.md`, `README.md`).
+
+## Funcionalidades implementadas en esta build
+
+Todo lo que hace distinta esta build frente al Telegram Desktop original.
+
+### Gestión de contenido (desbloqueos)
+| # | Función | En qué consiste |
+|---|---|---|
+| 1 | Copiar texto desbloqueado | Copiar texto en canales que lo prohibían |
+| 2 | Guardar/descargar desbloqueado | Guardar fotos, videos y documentos restringidos |
+| 3 | Selección de media desbloqueada | Marcar fotos/videos aunque el canal "no permita reenvíos" |
+| 4 | Selección sin límite de 100 | Marcar 200, 500 o 900+ ítems a la vez |
+| 5 | Shift + clic | Seleccionar por rangos de un golpe |
+| 6 | Seleccionar todo | Ctrl+A, menú contextual o botón superior (check circular) |
+| 7 | Cuadrícula densa | Miniaturas más pequeñas para ver más por pantalla |
+| 8 | Descargar siempre visible | Botón en el visor de media que fuerza la descarga original |
+| 9 | Ctrl+Shift+G en el visor | Saltar al mensaje en el chat desde la foto abierta |
+
+### Galería y perfiles
+| # | Función | En qué consiste |
+|---|---|---|
+| 10 | Botón único "Media" | Fotos y videos juntos en el perfil (incluye layout classic del canal) |
+| 11 | Filtros Todo / Fotos / Videos | Submenú superior de la galería unificada (sin GIF), "Todo" por defecto |
+| 12 | Pestañas ocultas si vacías | Fotos/Videos solo se muestran si hay contenido de ese tipo |
+| 13 | Módulo "Todo" (All) | Una cuadrícula con fotos + videos + archivos (sin stickers/GIF/voz), carga completa y orden cronológico |
+| 14 | Módulo "Fotos + Archivos" | En el perfil del canal: fotos y archivos juntos (sin videos), con lazy loading, conteo combinado, soporte de foros/temas, carga completa y nombres de archivo ocultos; se obtiene fusionando dos búsquedas MTP (Photo + File) |
+
+### Reenvío y borrado masivos
+| # | Función | En qué consiste |
+|---|---|---|
+| 15 | Reenvío masivo estable | Lotes de 100 en orden cronológico; 900+ llegan completos |
+| 16 | Cadena secuencial | Una petición en vuelo a la vez (sin flood ni desorden entre lotes) |
+| 17 | Sin límite práctico | Selección de hasta 10000 ítems (MaxSelectedItems) |
+| 18 | Fallo que no rompe | Un lote con error se reporta y la cadena continúa; successCallback siempre al final |
+| 19 | Opciones recordadas | "Sin autor" / "sin captions" se recuerdan entre reenvíos |
+| 20 | Orden cronológico | Primero los antiguos, después los recientes |
+| 21 | Borrado masivo fiable | Lotes de 100 al servidor; los borrados NO reaparecen |
+
+### Estabilidad de carga
+- Ventana de carga grande (≈2000 ids) en "Todo" y "Fotos + Archivos", mantenida al hacer scroll.
+- Materialización proactiva de todo el contenido, con paralelismo acotado (3 peticiones en vuelo) para no congelar la app.
+- Fin de lista honesto (sin "tope fantasma" que cortase la lista antes de tiempo).
+- Anti-bucle de reintentos y auto-reparación de búsquedas fallidas (PEER_ID_INVALID / red).
+- Depurador propio: archivo `depurador.txt` con diagnóstico de la carga de FilesPhotos/All.
+
+### Correcciones de crash destacadas
+- "Seleccionar todo" en Fotos + Archivos (geometría mixta foto/documento en la cuadrícula).
+- Arranque del módulo Fotos + Archivos (caso `Type::FilesPhotos` en la barra superior).
+- Cierre inesperado al reenviar varios archivos a la vez: el callable recursivo de la cadena de reenvío se auto-capturaba por valor (versión vacía) → `std::bad_function_call` → `abort`. Ahora se guarda en `shared_ptr<std::function>` y solo se invoca si existe; los lotes con peer origen vacío se saltan (evita `INPUT_PEERS_EMPTY`).
+
 ## Supported systems
 
 The latest version is available for

@@ -8,6 +8,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/media/info_media_inner_widget.h"
 
 #include <rpl/flatten_latest.h>
+#include <rpl/combine.h>
+#include <rpl/distinct_until_changed.h>
 #include "boxes/abstract_box.h"
 #include "info/media/info_media_list_widget.h"
 #include "info/media/info_media_buttons.h"
@@ -25,11 +27,40 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/vertical_layout.h"
 #include "ui/search_field_controller.h"
 #include "data/data_shared_media.h"
+#include "info/profile/info_profile_values.h"
 #include "styles/style_info.h"
 #include "lang/lang_keys.h"
 
 namespace Info {
 namespace Media {
+
+namespace {
+
+[[nodiscard]] QString FilterLabel(MediaFilter filter) {
+	switch (filter) {
+	case MediaFilter::All: return tr::lng_filters_all_short(tr::now);
+	case MediaFilter::Photos: return tr::lng_media_type_photos(tr::now);
+	case MediaFilter::Videos: return tr::lng_media_type_videos(tr::now);
+	case MediaFilter::Files: return tr::lng_media_type_files(tr::now);
+	}
+	Unexpected("Bad MediaFilter in Info::Media::FilterLabel()");
+}
+
+[[nodiscard]] std::vector<MediaFilter> FilterSections(
+		int photos,
+		int videos) {
+	auto result = std::vector<MediaFilter>();
+	result.push_back(MediaFilter::All);
+	if (photos > 0) {
+		result.push_back(MediaFilter::Photos);
+	}
+	if (videos > 0) {
+		result.push_back(MediaFilter::Videos);
+	}
+	return result;
+}
+
+} // namespace
 
 InnerWidget::InnerWidget(
 	QWidget *parent,
@@ -180,26 +211,77 @@ void InnerWidget::setupMediaFilter() {
 	if (!supportsMediaFilter()) {
 		return;
 	}
+	const auto peer = _controller->key().peer();
+	const auto topic = _controller->key().topic();
+	const auto sublist = _controller->key().sublist();
+	const auto topicRootId = topic ? topic->rootId() : MsgId();
+	const auto monoforumPeerId = sublist
+		? sublist->sublistPeer()->id
+		: PeerId();
+	const auto migrated = _controller->migrated();
+	using SharedMediaType = Storage::SharedMediaType;
+	rpl::combine(
+		Profile::SharedMediaCountValue(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			migrated,
+			SharedMediaType::Photo),
+		Profile::SharedMediaCountValue(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			migrated,
+			SharedMediaType::Video)
+	) | rpl::map([](int photos, int videos) {
+		return FilterSections(photos, videos);
+	}) | rpl::distinct_until_changed() | rpl::on_next([=](
+			const std::vector<MediaFilter> &sections) {
+		rebuildMediaFilter(sections);
+	}, _filterCountsLifetime);
+}
+
+void InnerWidget::rebuildMediaFilter(
+		const std::vector<MediaFilter> &sections) {
+	if (sections == _filterSections) {
+		return;
+	}
+	const auto current = _list->mediaFilter();
+	const auto found = [&] {
+		for (const auto &filter : sections) {
+			if (filter == current) {
+				return true;
+			}
+		}
+		return false;
+	}();
+	if (!found) {
+		_list->setMediaFilter(MediaFilter::All);
+	}
+	_filterSections = sections;
+	_filter.destroy();
 	_filter.create(this);
 	_filter->show();
-	_filter->addSection(tr::lng_filters_all_short(tr::now));
-	_filter->addSection(tr::lng_media_type_photos(tr::now));
-	_filter->addSection(tr::lng_media_type_videos(tr::now));
-	_filter->setActiveSectionFast(0);
-	_filter->sectionActivated(
-	) | rpl::on_next([=](int section) {
-		switch (section) {
-		case 1:
-			_list->setMediaFilter(MediaFilter::Photos);
-			break;
-		case 2:
-			_list->setMediaFilter(MediaFilter::Videos);
-			break;
-		default:
-			_list->setMediaFilter(MediaFilter::All);
+	for (const auto &filter : _filterSections) {
+		_filter->addSection(FilterLabel(filter));
+	}
+	const auto active = _list->mediaFilter();
+	auto activeIndex = 0;
+	for (auto i = 0; i < int(_filterSections.size()); ++i) {
+		if (_filterSections[i] == active) {
+			activeIndex = i;
 			break;
 		}
+	}
+	_filter->setActiveSectionFast(activeIndex);
+	_filter->sectionActivated(
+	) | rpl::on_next([=](int section) {
+		if (section >= 0 && section < int(_filterSections.size())) {
+			_list->setMediaFilter(_filterSections[section]);
+		}
 	}, _filter->lifetime());
+	_filter->resizeToWidth(width());
+	refreshHeight();
 }
 
 void InnerWidget::setupFileViewToggle() {

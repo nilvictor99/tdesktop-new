@@ -64,6 +64,7 @@ int MinItemHeight(Type type, int width) {
 
 	switch (type) {
 	case Type::FilesPhotos:
+	case Type::All:
 	case Type::Photo:
 	case Type::GIF:
 	case Type::Video:
