@@ -8,6 +8,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "apiwrap.h"
 
 #include <functional>
+#include <QtCore/QSet>
+#include <QtCore/QFile>
+#include <QtCore/QDataStream>
 
 #include "debug_depurador.h"
 #include "api/api_authorizations.h"
@@ -70,9 +73,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_history_messages.h"
 #include "core/core_cloud_password.h"
 #include "core/application.h"
+#include "base/timer.h"
+#include "base/weak_ptr.h"
 #include "base/unixtime.h"
 #include "base/random.h"
 #include "base/call_delayed.h"
+#include "crl/crl.h"
+#include <optional>
 #include "lang/lang_keys.h"
 #include "mainwidget.h"
 #include "boxes/add_contact_box.h"
@@ -4192,6 +4199,92 @@ void ApiWrap::sendAction(const SendAction &action) {
 	_sendActions.fire_copy(action);
 }
 
+namespace {
+
+// ── Reenvío masivo robusto e indefinido (Ronda 22e/23) ──────────────────────
+// La cuota invisible del servidor (~2000 reenvíos/hora) es inevitable;
+// el cliente debe DOSIFICAR para no golpearla y, cuando el servidor retenga un
+// lote, ESPERAR y CONTINUAR — nunca saltar un lote. Como la capa MTProto traga
+// silenciosamente los FLOOD_WAIT (reprograma la misma RPC), el único sensor
+// fiable es la LATENCIA de cada lote: si una respuesta tarda mucho más que la
+// pausa programada, es que el servidor nos retuvo → AIMD se endurece.
+constexpr auto kForwardChunkFastGapMs = crl::time(5000);     // ritmo rápido (arranque)
+constexpr auto kForwardChunkMinGapMs = crl::time(100000);   // 100 s: ritmo sostenible
+constexpr auto kForwardChunkMaxGapMs = crl::time(300000);   // 5 min: fondo de espera
+constexpr auto kForwardFastStartChunks = 15;                // primer bloque libre (~1500 msgs)
+constexpr auto kForwardFloodWallSecs = 7200;                // 2 h máx. de retención por flood
+constexpr auto kForwardAdaptiveStepMs = crl::time(10000);   // paso AIMD de recuperación
+constexpr auto kForwardLatencySpikeMs = crl::time(5000);    // retardo extra que delata flood
+constexpr auto kForwardProgressEveryMs = crl::time(3000);   // refresco del toast
+constexpr auto kForwardResumeEveryChunks = 5;               // persistir progreso cada N lotes
+constexpr auto kForwardResumeMagic = quint32(0x46574452);   // "FWDR"
+
+// Progreso del reenvío persistido en disco. Permite "continuar donde quedó" al
+// reenviar la misma selección al mismo destino tras un corte o reinicio de la
+// app: los ids ya confirmados se saltan en lugar de reenviarse o perderse.
+using ForwardSentSet = QSet<qint64>;
+
+struct ForwardResumeData {
+	quint64 toPeerBare = 0;
+	int sentTotal = 0;
+	ForwardSentSet sentIds;
+};
+
+[[nodiscard]] QString ForwardResumePath() {
+	return cWorkingDir() + QStringLiteral("reenvio_reanudable.dat");
+}
+
+[[nodiscard]] std::optional<ForwardResumeData> ReadForwardResume() {
+	ForwardResumeData result;
+	QFile file(ForwardResumePath());
+	if (!file.open(QIODevice::ReadOnly)) {
+		return std::nullopt;
+	}
+	QDataStream stream(&file);
+	quint32 magic = 0;
+	stream >> magic;
+	if (magic != kForwardResumeMagic) {
+		return std::nullopt;
+	}
+	stream >> result.toPeerBare >> result.sentTotal;
+	quint32 idsCount = 0;
+	stream >> idsCount;
+	result.sentIds.reserve(int(idsCount));
+	for (quint32 i = 0; i < idsCount; ++i) {
+		qint64 id = 0;
+		stream >> id;
+		result.sentIds.insert(id);
+	}
+	return result;
+}
+
+void WriteForwardResume(
+		quint64 toPeerBare,
+		int sentTotal,
+		const ForwardSentSet &sentIds) {
+	if (sentIds.isEmpty() && !sentTotal) {
+		return;
+	}
+	QFile file(ForwardResumePath());
+	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+		return;
+	}
+	QDataStream stream(&file);
+	stream << quint32(kForwardResumeMagic)
+		<< quint64(toPeerBare)
+		<< int(sentTotal)
+		<< quint32(sentIds.size());
+	for (const auto id : sentIds) {
+		stream << qint64(id);
+	}
+}
+
+void ClearForwardResume() {
+	QFile::remove(ForwardResumePath());
+}
+
+} // namespace
+
 void ApiWrap::finishForwarding(const SendAction &action) {
 	const auto history = action.history;
 	const auto topicRootId = action.replyTo.topicRootId;
@@ -4227,7 +4320,8 @@ void ApiWrap::finishForwarding(const SendAction &action) {
 void ApiWrap::forwardMessages(
 		Data::ResolvedForwardDraft &&draft,
 		SendAction action,
-		FnMut<void()> &&successCallback) {
+		FnMut<void()> &&successCallback,
+		Fn<void(int sent, int total, std::optional<int> floodWaitSecs)> progress) {
 	Expects(!draft.items.empty());
 
 	constexpr auto kMaxForwardMessages = 100;
@@ -4249,13 +4343,47 @@ void ApiWrap::forwardMessages(
 		}
 		return;
 	}
+
+	// Reanudación: si hay un archivo de progreso previo para este peer,
+	// eliminamos los ids que ya se confirmaron para no reenviarlos dos veces.
+	const auto resumeOpt = ReadForwardResume();
+	auto resumeSkipped = 0;
+	if (resumeOpt
+		&& resumeOpt->toPeerBare == quint64(action.history->peer->id.value)) {
+		const auto &sentIds = resumeOpt->sentIds;
+		const auto before = draft.items.size();
+		for (auto i = begin(draft.items); i != end(draft.items);) {
+			if (sentIds.contains((*i)->id.bare)) {
+				i = draft.items.erase(i);
+			} else {
+				++i;
+			}
+		}
+		if (draft.items.size() == before) {
+			// Selección distinta a la guardada: progreso obsoleto.
+			ClearForwardResume();
+		} else {
+			resumeSkipped = int(sentIds.size());
+			if (draft.items.empty()) {
+				Depur::append(QStringLiteral("[DEPUR] FWD Reanudación: todos los items ya enviados, limpiando."));
+				ClearForwardResume();
+				if (successCallback) {
+					successCallback();
+				}
+				return;
+			}
+			Depur::append(QStringLiteral("[DEPUR] FWD Reanudación: saltados %1 ya enviados, quedan %2.")
+				.arg(resumeSkipped)
+				.arg(draft.items.size()));
+		}
+	}
+
 	draft.options = HistoryView::Controls::NormalizeForwardOptions(
 		_session,
 		draft.items,
 		draft.options);
 
 	struct SharedCallback {
-		int requestsLeft = 0;
 		FnMut<void()> callback;
 	};
 	const auto shared = successCallback
@@ -4337,6 +4465,7 @@ void ApiWrap::forwardMessages(
 	struct ForwardChunk {
 		not_null<PeerData*> from;
 		QVector<MTPint> ids;
+		QVector<qint64> rawIds;
 		QVector<MTPlong> randomIds;
 		std::shared_ptr<base::flat_map<uint64, FullMsgId>> localIds;
 	};
@@ -4344,6 +4473,7 @@ void ApiWrap::forwardMessages(
 	chunks.reserve(1 + count / kMaxForwardMessages);
 	{
 		auto ids = QVector<MTPint>();
+		auto rawIds = QVector<qint64>();
 		auto randomIds = QVector<MTPlong>();
 		auto localIds = std::shared_ptr<base::flat_map<uint64, FullMsgId>>();
 		const auto flush = [&] {
@@ -4353,14 +4483,17 @@ void ApiWrap::forwardMessages(
 			chunks.push_back(ForwardChunk{
 				.from = forwardFrom,
 				.ids = std::move(ids),
+				.rawIds = std::move(rawIds),
 				.randomIds = std::move(randomIds),
 				.localIds = std::move(localIds),
 			});
 			ids = QVector<MTPint>();
+			rawIds = QVector<qint64>();
 			randomIds = QVector<MTPlong>();
 			localIds = nullptr;
 		};
 		ids.reserve(count);
+		rawIds.reserve(count);
 		randomIds.reserve(count);
 		for (const auto &item : draft.items) {
 			const auto randomId = base::RandomValue<uint64>();
@@ -4397,6 +4530,7 @@ void ApiWrap::forwardMessages(
 				forwardFrom = newFrom;
 			}
 			ids.push_back(MTP_int(item->id));
+			rawIds.push_back(item->id.bare);
 			randomIds.push_back(MTP_long(randomId));
 		}
 		flush();
@@ -4404,34 +4538,124 @@ void ApiWrap::forwardMessages(
 
 	const auto scheduled = action.options.scheduled;
 	const auto starsLeft = std::make_shared<int>(action.options.starsApproved);
-	const auto nextIndex = std::make_shared<int>(0);
+	const auto totalForProgress = resumeSkipped + count;
 
-	// Cadena de reenvío (estable, sin límite total y conservando la cronología):
-	// los lotes se envían de UNO en UNO — cada lote espera a que el anterior
-	// termine (con éxito o con fallo) antes de enviar el siguiente. De esta
-	// forma la cadena nunca se rompe:
-	//  - si un lote falla se reporta el error, pero se continúa reenviando el
-	//    resto hasta que se reenvía TODO lo seleccionado ("procesar hasta
-	//    terminar");
-	//  - el successCallback se dispara SIEMPRE al terminar el último lote,
-	//    aunque haya habido fallos (antes un fallo dejaba la cuenta pendiente
-	//    para siempre y la funcionalidad se quedaba colgada);
-	//  - con reenvíos de más de 1000 mensajes no se lanzan decenas de
-	//    peticiones a la vez (que provocaban flood y mensajes desordenados),
-	//    sino una sola en vuelo, manteniendo la cronología exacta y sin
-	//    sobrecargar la API.
-	// El callable recursivo de la cadena se guarda en un shared_ptr:
-	// capturarlo por valor copiaría la versión VACÍA inicial (invocar esa
-	// copia lanza std::bad_function_call -> abort y cierra la app al reenviar
-	// varios lotes), y capturarlo por referencia dejaría una referencia
-	// colgante al salir de forwardMessages. Con shared_ptr el estado vive
-	// mientras la cadena esté en vuelo y la recursión avanza de forma segura.
-	const auto sendNextChunk = std::make_shared<std::function<void()>>();
-	*sendNextChunk = [=, &histories] {
-		const auto index = (*nextIndex)++;
-		if (index >= int(chunks.size())) {
+	// ForwardPipeline: estado vivo del reenvío masivo indefinido.
+	// Guarda la cadena en un shared_ptr para que el estado viva mientras esté
+	// en vuelo (evita dangling references y copies vacías de std::function).
+	// Pacing AIMD: el hueco entre lotes se ajusta automáticamente a la cuota
+	// invisible del servidor, con reintento del MISMO lote en FLOOD_WAIT.
+	struct ForwardPipeline {
+		base::Timer pipelineTimer;
+		base::Timer watchdogTimer;
+		base::Timer progressTimer;
+
+		int nextIndex = 0;
+		int sentConfirmed = 0;
+
+		crl::time pauseMs = kForwardChunkFastGapMs;
+		crl::time lastActivityAt = crl::time();
+		crl::time lastSendAt = crl::time();
+		int fastStartChunksLeft = kForwardFastStartChunks;
+		std::int64_t floodWaitEndsAt = 0;
+		int floodRetries = 0;
+		bool inFlight = false;
+
+		base::weak_ptr<Ui::Toast::Instance> toast;
+		bool finished = false;
+	};
+	const auto pipeline = std::make_shared<ForwardPipeline>();
+	pipeline->sentConfirmed = resumeSkipped;
+	pipeline->lastActivityAt = crl::now();
+
+	const auto fireProgress = [=] {
+		if (progress) {
+			progress(pipeline->sentConfirmed, totalForProgress, std::nullopt);
+		}
+	};
+
+	const auto fireFloodProgress = [=](int waitSecs) {
+		if (progress) {
+			progress(pipeline->sentConfirmed, totalForProgress, waitSecs);
+		}
+	};
+
+	const auto showToast = [=](const QString &text, crl::time durationMs = 4000) {
+		if (const auto old = pipeline->toast.get()) {
+			old->hideAnimated();
+		}
+		pipeline->toast = Ui::Toast::Show(Ui::Toast::Config{
+			.text = text,
+			.duration = durationMs,
+		});
+	};
+
+	const auto finishPipeline = [=] {
+		if (pipeline->finished) {
 			return;
 		}
+		pipeline->finished = true;
+		pipeline->pipelineTimer.cancel();
+		pipeline->watchdogTimer.cancel();
+		pipeline->progressTimer.cancel();
+		// Romper el ciclo pipeline→timer→callback→pipeline para no filtrar
+		// el estado una vez terminado el reenvío.
+		pipeline->pipelineTimer.setCallback(nullptr);
+		pipeline->watchdogTimer.setCallback(nullptr);
+		pipeline->progressTimer.setCallback(nullptr);
+		if (const auto t = pipeline->toast.get()) {
+			t->hideAnimated();
+		}
+		ClearForwardResume();
+		if (shared) {
+			shared->callback();
+		}
+	};
+
+	// Mientras un lote está en vuelo y el servidor lo retiene (flood invisible),
+	// mostrar el tiempo de espera transcurrido para que no parezca colgado.
+	pipeline->progressTimer.setCallback([=] {
+		if (pipeline->finished || !pipeline->inFlight) {
+			return;
+		}
+		const auto elapsed = (crl::now() - pipeline->lastSendAt) / 1000;
+		if (elapsed > 0) {
+			showToast(
+				u"Esperando al servidor… %1 s"_q
+					.arg(elapsed),
+				kForwardProgressEveryMs);
+		}
+	});
+
+	pipeline->pipelineTimer.setCallback([=, &histories] {
+		if (pipeline->finished) {
+			return;
+		}
+		// Si hay un flood activo, esperar a que pase.
+		if (pipeline->floodWaitEndsAt > 0) {
+			const auto remaining = pipeline->floodWaitEndsAt
+				- (crl::now() / 1000);
+			if (remaining > 0) {
+				showToast(
+					u"Flood: faltan %1s para reanudar…"_q
+						.arg(remaining),
+					kForwardProgressEveryMs);
+				pipeline->pipelineTimer.callOnce(kForwardProgressEveryMs);
+				return;
+			}
+			// Flood terminó, reintentar el MISMO chunk.
+			pipeline->floodWaitEndsAt = 0;
+		}
+
+		const auto index = pipeline->nextIndex;
+		if (index >= int(chunks.size())) {
+			finishPipeline();
+			showToast(
+				u"Reenvío completo: %1 mensajes"_q
+					.arg(pipeline->sentConfirmed));
+			return;
+		}
+
 		const auto &chunk = chunks[index];
 		const auto idsCopy = chunk.localIds;
 		const auto fromId = chunk.from->id;
@@ -4486,35 +4710,35 @@ void ApiWrap::forwardMessages(
 				MTP_long(starsPaid),
 				Api::SuggestToMTP(action.options.suggest));
 		};
-		// Defensivo: solo se invoca un handler si realmente existe. Invocar
-		// un std::function vacío lanza std::bad_function_call (excepción no
-		// capturable en esta ruta), termina el proceso con abort() y cierra
-		// la app de forma inesperada al reenviar varios archivos a la vez.
-		const auto settle = [=] {
-			if (shared
-				&& !--shared->requestsLeft
-				&& shared->callback) {
-				shared->callback();
-			}
-			if (*nextIndex < int(chunks.size()) && *sendNextChunk) {
-				(*sendNextChunk)();
-			}
-		};
+
 		// Defensivo: si el peer de origen del lote se resuelve vacío (por
 		// ejemplo un usuario/canal cuyo acceso aún no está cargado), la API
-		// rechaza la petición con INPUT_PEERS_EMPTY. En lugar de enviar una
-		// petición inválida, se salta el lote y la cadena continúa reenviando
-		// el resto. Nunca se pierde la cuenta: se avanza al siguiente lote.
+		// rechazaría la petición. Saltamos el chunk y seguimos.
 		if (ids.isEmpty() || fromInput.type() == mtpc_inputPeerEmpty) {
-			settle();
+			pipeline->nextIndex = index + 1;
+			pipeline->sentConfirmed += int(ids.size());
+			if (pipeline->nextIndex >= int(chunks.size())) {
+				finishPipeline();
+				return;
+			}
+			pipeline->pipelineTimer.callOnce(pipeline->pauseMs);
 			return;
 		}
+
+		pipeline->lastActivityAt = crl::now();
+		pipeline->lastSendAt = crl::now();
+		pipeline->inFlight = true;
+		pipeline->progressTimer.callEach(kForwardProgressEveryMs);
+
 		histories.sendPreparedMessage(
 			history,
 			FullReplyTo{ .topicRootId = topicRootId },
 			uint64(0),
 			std::move(buildMessage),
 			[=](const MTPUpdates &result, const MTP::Response &) {
+				if (pipeline->finished) {
+					return;
+				}
 				if (!scheduled) {
 					_session->api().updates().checkForSentToScheduled(
 						result);
@@ -4526,9 +4750,87 @@ void ApiWrap::forwardMessages(
 						peer->id,
 						fromId);
 				}
-				settle();
+
+				const auto elapsed = crl::now() - pipeline->lastSendAt;
+				pipeline->inFlight = false;
+				pipeline->progressTimer.cancel();
+				pipeline->nextIndex = index + 1;
+				pipeline->sentConfirmed += int(ids.size());
+				pipeline->floodRetries = 0;
+				pipeline->lastActivityAt = crl::now();
+
+				// AIMD guiado por latencia: si el lote tardó mucho más de lo
+				// programado, el servidor nos retuvo (flood invisible) y hay
+				// que endurecer el ritmo; si respondió al vuelo, recuperamos
+				// ritmo hacia el máximo sostenible sin volver a golpear.
+				const auto spike
+					= (elapsed > pipeline->pauseMs
+						+ kForwardLatencySpikeMs);
+				if (spike) {
+					pipeline->fastStartChunksLeft = 0;
+					pipeline->pauseMs = std::min(
+						kForwardChunkMaxGapMs,
+						pipeline->pauseMs * 2);
+					pipeline->pauseMs = std::max(
+						kForwardChunkMinGapMs,
+						pipeline->pauseMs);
+				} else if (pipeline->fastStartChunksLeft > 0) {
+					--pipeline->fastStartChunksLeft;
+					if (pipeline->fastStartChunksLeft == 0) {
+						// Primer bloque libre agotado: ritmo sostenible.
+						pipeline->pauseMs = kForwardChunkMinGapMs;
+					}
+				} else {
+					pipeline->pauseMs = std::max(
+						kForwardChunkMinGapMs,
+						pipeline->pauseMs - kForwardAdaptiveStepMs);
+				}
+
+				if (spike) {
+					fireFloodProgress(int(elapsed / 1000));
+				} else {
+					fireProgress();
+				}
+
+				// Persistir progreso periódicamente: solo los ids YA
+				// confirmados (chunks anteriores a nextIndex) para que una
+				// reanudación continúe donde quedó sin duplicar.
+				if (pipeline->nextIndex % kForwardResumeEveryChunks == 0) {
+					ForwardSentSet sentIds;
+					sentIds.reserve(pipeline->nextIndex * kMaxForwardMessages);
+					for (auto i = 0; i < pipeline->nextIndex; ++i) {
+						for (const auto id : chunks[i].rawIds) {
+							sentIds.insert(id);
+						}
+					}
+					WriteForwardResume(
+						quint64(peer->id.value),
+						pipeline->sentConfirmed,
+						sentIds);
+				}
+
+				Depur::append(QStringLiteral("[DEPUR] FWD OK chunk %1/%2 sent=%3 pause=%4ms")
+					.arg(index + 1)
+					.arg(chunks.size())
+					.arg(pipeline->sentConfirmed)
+					.arg(pipeline->pauseMs));
+
+				if (pipeline->nextIndex >= int(chunks.size())) {
+					finishPipeline();
+					showToast(
+						u"Reenvío completo: %1 mensajes"_q
+							.arg(pipeline->sentConfirmed));
+					return;
+				}
+
+				pipeline->pipelineTimer.callOnce(pipeline->pauseMs);
 			},
 			[=](const MTP::Error &error, const MTP::Response &) {
+				if (pipeline->finished) {
+					return;
+				}
+				pipeline->inFlight = false;
+				pipeline->progressTimer.cancel();
 				if (idsCopy) {
 					for (const auto &[randomId, itemId] : *idsCopy) {
 						_session->api().sendMessageFail(
@@ -4540,16 +4842,100 @@ void ApiWrap::forwardMessages(
 				} else {
 					_session->api().sendMessageFail(error, peer);
 				}
-				// IMPORTANTE: un lote con fallo NO rompe la cadena. Se
-				// reporta el error y se continúa con el siguiente lote hasta
-				// reenviar todo lo seleccionado.
-				settle();
+
+				// Detectar FLOOD_WAIT_<secs> del servidor.
+				const auto type = error.type();
+				auto floodSecs = 0;
+				if (type.startsWith(u"FLOOD_WAIT_"_q)) {
+					floodSecs = type.mid(11).toInt();
+				}
+				if (floodSecs > 0) {
+					floodSecs = std::min(floodSecs, kForwardFloodWallSecs);
+					const auto endsAt = (crl::now() / 1000) + floodSecs;
+					if (endsAt > pipeline->floodWaitEndsAt) {
+						pipeline->floodWaitEndsAt = endsAt;
+					}
+					++pipeline->floodRetries;
+
+					Depur::append(QStringLiteral("[DEPUR] FWD FLOOD chunk %1/%2 wait=%3s retries=%4")
+						.arg(index + 1)
+						.arg(chunks.size())
+						.arg(floodSecs)
+						.arg(pipeline->floodRetries));
+
+					// AIMD: aumentar pausa drásticamente (decrease goodput).
+					pipeline->pauseMs = std::min(
+						kForwardChunkMaxGapMs,
+						pipeline->pauseMs * 2);
+
+					fireFloodProgress(floodSecs);
+					pipeline->pipelineTimer.callOnce(
+						kForwardProgressEveryMs); // reevaluar pronto
+					return;
+				}
+
+				// Otro error: incrementar pausa y continuar.
+				++pipeline->nextIndex;
+				pipeline->sentConfirmed += int(ids.size());
+				++pipeline->floodRetries;
+
+				Depur::append(QStringLiteral("[DEPUR] FWD FAIL chunk %1/%2 err=%3 retries=%4")
+					.arg(index + 1)
+					.arg(chunks.size())
+					.arg(type)
+					.arg(pipeline->floodRetries));
+
+				if (pipeline->nextIndex >= int(chunks.size())) {
+					finishPipeline();
+					showToast(
+						u"Reenvío terminado (con errores): %1 mensajes"_q
+							.arg(pipeline->sentConfirmed));
+					return;
+				}
+
+				fireProgress();
+				pipeline->pipelineTimer.callOnce(pipeline->pauseMs);
 			});
-	};
-	if (shared) {
-		shared->requestsLeft = int(chunks.size());
-	}
-	(*sendNextChunk)();
+	});
+
+	// Watchdog: si el pipeline se queda inactivo más del doble del muro flood
+	// y no hay flood activo, abortar limpiamente.
+	pipeline->watchdogTimer.setCallback([=] {
+		if (pipeline->finished) {
+			return;
+		}
+		const auto elapsed = crl::now() - pipeline->lastActivityAt;
+		const auto wallMs = crl::time(kForwardFloodWallSecs * 1000);
+		if (elapsed > wallMs * 2 && pipeline->floodWaitEndsAt <= 0) {
+			Depur::append(QStringLiteral("[DEPUR] FWD Watchdog: abort por inactividad %1ms")
+				.arg(elapsed));
+			showToast(u"Reenvío abortado por timeout"_q, 6000);
+			finishPipeline();
+		}
+	});
+	pipeline->watchdogTimer.callEach(crl::time(kForwardFloodWallSecs * 500));
+
+	// Iniciar la cadena.
+	pipeline->pipelineTimer.callOnce(crl::time(0));
+
+	// Si la sesión se destruye (logout, cierre) mientras el reenvío está
+	// en vuelo, cancelar las timers para evitar callbacks sobre objetos
+	// destruidos. El archivo de reanudación se mantiene intacto para que
+	// al reabrir la app el usuario pueda reenviar la selección y continuar.
+	_session->lifetime().add([
+		weak = std::weak_ptr<ForwardPipeline>(pipeline)
+	] {
+		if (const auto strong = weak.lock()) {
+			strong->pipelineTimer.cancel();
+			strong->watchdogTimer.cancel();
+			strong->progressTimer.cancel();
+			strong->pipelineTimer.setCallback(nullptr);
+			strong->watchdogTimer.setCallback(nullptr);
+			strong->progressTimer.setCallback(nullptr);
+			strong->finished = true;
+		}
+	});
+
 	_session->data().sendHistoryChangeNotifications();
 }
 

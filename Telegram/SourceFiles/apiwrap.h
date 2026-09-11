@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/sender.h"
 #include "data/stickers/data_stickers_set.h"
 #include "data/data_messages.h"
+#include <optional>
 
 class TaskQueue;
 class HistoryItem;
@@ -352,7 +353,8 @@ public:
 	void forwardMessages(
 		Data::ResolvedForwardDraft &&draft,
 		SendAction action,
-		FnMut<void()> &&successCallback = nullptr);
+		FnMut<void()> &&successCallback = nullptr,
+		Fn<void(int sent, int total, std::optional<int> floodWaitSecs)> progress = nullptr);
 	void shareContact(
 		const QString &phone,
 		const QString &firstName,
