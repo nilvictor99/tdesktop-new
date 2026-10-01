@@ -18,8 +18,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_chat_helpers.h"
 #include "styles/style_info.h"
 
-#include <QPainterPath>
-
 namespace Info::Media {
 namespace {
 
@@ -580,37 +578,23 @@ void ListSection::paintFileTile(
 	p.setBrush(st::windowBgRipple);
 	p.drawRoundedRect(rect, st::roundRadiusLarge, st::roundRadiusLarge);
 
-	const auto side = std::min(
-		rect.width() * 55 / 100,
-		rect.height() * 60 / 100);
-	const auto iconRect = QRect(
-		rect.x() + (rect.width() - side) / 2,
-		rect.y() + (rect.height() - side) / 2,
-		side,
-		side);
-	p.setBrush(QColor(0x33, 0x90, 0xEC));
-	p.drawRoundedRect(iconRect, 4, 4);
-
-	QPainterPath fold;
-	fold.moveTo(iconRect.right() - side * 18 / 100, iconRect.top());
-	fold.lineTo(iconRect.right(), iconRect.top() + side * 18 / 100);
-	fold.lineTo(iconRect.right() - side * 18 / 100, iconRect.top() + side * 18 / 100);
-	fold.closeSubpath();
-	p.setBrush(QColor(255, 255, 255, 70));
-	p.drawPath(fold);
-
-	p.setBrush(QColor(255, 255, 255, 140));
-	const auto lineW = side * 3 / 5;
-	for (auto i = 0; i != 3; ++i) {
-		p.drawRoundedRect(
-			QRect(
-				iconRect.x() + (side - lineW) / 2,
-				iconRect.y() + side * (34 + i * 20) / 100,
-				lineW,
-				std::max(2, side / 22)),
-			1,
-			1);
-	}
+	// Contenido real del archivo (icono del documento, sin nombre cuando el
+	// módulo está en galería) centrado dentro del tile, en lugar de un icono
+	// genérico. Mismo patrón de pintado que usa el mosaico más abajo.
+	const auto point = QPoint(
+		rect.x() + qMax(0, (rect.width() - item->width()) / 2),
+		rect.y() + qMax(0, (rect.height() - item->height()) / 2));
+	auto localContext = context.layoutContext;
+	p.save();
+	p.setClipRect(rect);
+	p.translate(point.x(), point.y());
+	item->paint(
+		p,
+		rect.translated(-point),
+		TextSelection(),
+		&localContext);
+	p.translate(-point.x(), -point.y());
+	p.restore();
 
 	if (selected) {
 		p.setPen(Qt::NoPen);

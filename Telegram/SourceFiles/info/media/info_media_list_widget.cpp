@@ -1046,6 +1046,7 @@ void ListWidget::setFileGridColumns(int columns) {
 	}
 	clearSelected();
 	_fileGridColumns = columns;
+	_provider->setFileGridColumns(columns);
 	resizeGetHeight(width());
 	update();
 }

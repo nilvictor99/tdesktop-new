@@ -42,6 +42,19 @@ constexpr auto kPreloadedScreensCount = 4;
 constexpr auto kPreloadedScreensCountFull
 	= kPreloadedScreensCount + 1 + kPreloadedScreensCount;
 
+// Módulos que mantienen la ventana grande de ids también al scrollear.
+[[nodiscard]] bool WideWindowType(Type type) {
+	return (type == Type::All) || (type == Type::File);
+}
+
+// Módulos que materializan proactivamente los ids sin HistoryItem para que
+// ninguna celda quede vacía.
+[[nodiscard]] bool ProactiveType(Type type) {
+	return (type == Type::FilesPhotos)
+		|| (type == Type::All)
+		|| (type == Type::File);
+}
+
 } // namespace
 
 Provider::Provider(not_null<AbstractController*> controller)
@@ -56,9 +69,14 @@ Provider::Provider(not_null<AbstractController*> controller)
 , _migrated(_controller->migrated())
 , _type(_controller->section().mediaType())
 , _slice(sliceKey(_universalAroundId)) {
-	if (_type == Type::FilesPhotos || _type == Type::All) {
-		// Ventana grande de entrada para que el módulo compuesto cargue todo
-		// su contenido de una vez (ver kFullIdsLimit).
+	if (WideWindowType(_type)) {
+		// "Todo" y "Archivos" conservan la ventana grande de entrada. Fotos +
+		// Archivos pagina por scroll con la ventana mínima como el resto de
+		// módulos (paridad con Foto + Vídeo: cada página se pide al scrollear).
+		// En Archivos la búsqueda es una sola (solo archivos, sin unir fotos),
+		// así que la ventana grande no duplica tráfico y evita páginas de 16 en
+		// 16 al entrar: la galería se llena de una vez y sigue creciendo al
+		// scrollear sin huecos.
 		_idsLimit = kFullIdsLimit;
 	}
 	_controller->session().data().itemRemoved(
@@ -233,7 +251,7 @@ std::optional<int> Provider::fullCount() {
 void Provider::restart() {
 	_layouts.clear();
 	_universalAroundId = kDefaultAroundId;
-	_idsLimit = (_type == Type::FilesPhotos || _type == Type::All)
+	_idsLimit = WideWindowType(_type)
 		? kFullIdsLimit
 		: kMinimalIdsLimit;
 	_slice = SparseIdsMergedSlice(sliceKey(_universalAroundId));
@@ -282,15 +300,13 @@ void Provider::checkPreload(
 			preloadRequired = (qAbs(*delta) >= minUniversalIdDelta);
 		}
 		if (preloadRequired) {
-			// Los módulos compuestos (FilesPhotos/All) mantienen la ventana
-			// GRANDE de entrada también al hacer scroll (en lugar de encogerla a
-			// la mínima de preload ~128). Si se encoge, al llegar a una zona del
-			// historial cuyos ids aún no están cacheados la cuadrícula se queda
-			// sin contenido y el muestreo "se congela", y solo se rellena al
-			// saltar a un mensaje (que sí usa kFullIdsLimit). Mantener la
-			// ventana grande hace que el sparse-builder pida y cachee muy por
-			// delante, igual que al arrancar, evitando el congelamiento.
-			_idsLimit = (_type == Type::FilesPhotos || _type == Type::All)
+			// Solo "Todo" y "Archivos" mantienen la ventana GRANDE también al
+			// hacer scroll. Fotos + Archivos pagina por scroll como Fotos +
+			// Vídeo: con la ventana mínima de preload el sparse-builder pide la
+			// página vecina al acercarse a un borde (insufficientAround), y cada
+			// respuesta ejecuta addNewMessage → el HistoryItem queda en memoria →
+			// no hay celdas sin contenido ni congelamiento.
+			_idsLimit = WideWindowType(_type)
 				? kFullIdsLimit
 				: preloadIdsLimit;
 			_universalAroundId = universalId;
@@ -331,14 +347,13 @@ void Provider::refreshViewer() {
 		if (auto nearest = _slice.nearest(idForViewer)) {
 			_universalAroundId = GetUniversalId(*nearest);
 		}
-		// Nueva región al scrollear: presupuesto de materialización fresco, para
-		// que cada zona que el usuario recorre rellene sus huecos aunque zonas
-		// anteriores hubieran agotado el tope de reintentos. Sin esto, en
-		// canales con mucha media el contador llega a su tope y toda zona nueva
-		// quedaba con huecos permanentes hasta abrir el chat.
+		// Presupuesto de materialización fresco por refresh: cada nueva región que
+		// el usuario alcanza al scrollear vuelve a pedir sus huecos aunque zonas
+		// anteriores hubieran agotado el tope de reintentos. Con ventana
+		// pequeña (~unas pantallas) cada pase es de 1-3 lotes y barato.
 		_missingRequested = false;
 		_missingRetries = 0;
-		if (_type == Type::FilesPhotos || _type == Type::All) {
+		if (ProactiveType(_type)) {
 			const auto skippedBefore = _slice.skippedBefore();
 			const auto skippedAfter = _slice.skippedAfter();
 			Depur::append(
@@ -354,13 +369,15 @@ void Provider::refreshViewer() {
 					? Depur::num(*skippedAfter)
 					: QStringLiteral("?")));
 		}
-		if (_type == Type::FilesPhotos || _type == Type::All) {
+		if (ProactiveType(_type)) {
 			// Materialización PROACTIVA: nada más llegar la slice, pedimos que
-			// se materialicen TODOS sus ids sin HistoryItem (lotes ≤100). Así la
-			// ventana grande se rellena entera de una vez y no quedan archivos
-			// que solo aparecían al usar "mostrar en el chat" (que re-materializa
-			// el Historial). El guard _missingRequested evita duplicar peticiones
-			// y _missingRetries (reset por slice) evita bucles con ids borrados.
+			// se materialicen todos sus ids sin HistoryItem (lotes ≤100). Así la
+			// ventana se rellena de una vez y no quedan archivos que solo
+			// aparecían al usar "mostrar en el chat" (que re-materializa el
+			// Historial). El guard _missingRequested evita duplicar peticiones;
+			// en FilesPhotos solo se materializa la ventana visible (±400) y
+			// _missingRetries evita bucles con ids borrados, refrescándose por
+			// zona (no por slice) para no encender un pase tras cada página.
 			requestMissingAround(_universalAroundId);
 		}
 		_refreshed.fire({});
@@ -378,6 +395,18 @@ void Provider::setMediaFilter(MediaFilter filter) {
 
 bool Provider::supportsMediaFilter() const {
 	return _type == Type::PhotoVideo;
+}
+
+void Provider::setFileGridColumns(int columns) {
+	if (_fileGridColumns == columns) {
+		return;
+	}
+	_fileGridColumns = columns;
+	// Los layouts ya construidos guardan si el documento muestra su nombre:
+	// hay que reconstruirlos para que el cambio lista <-> galería se aplique
+	// sin volver a pedir datos al servidor.
+	markLayoutsStale();
+	_refreshed.fire({});
 }
 
 bool Provider::matchesFilter(not_null<const HistoryItem*> item) const {
@@ -410,7 +439,7 @@ std::vector<ListSection> Provider::fillSections(
 		if (layout && !matchesFilter(layout->getItem())) {
 			continue;
 		}
-		if (!layout && (_type == Type::FilesPhotos || _type == Type::All)) {
+		if (!layout && ProactiveType(_type)) {
 			// Composite types can hold ids whose HistoryItem is not yet
 			// materialized in memory (large channels, or the History was
 			// unloaded elsewhere). We collect every un-materialized id of the
@@ -436,7 +465,7 @@ std::vector<ListSection> Provider::fillSections(
 		section.finishSection();
 		result.push_back(std::move(section));
 	}
-	if ((_type == Type::FilesPhotos || _type == Type::All)
+	if (ProactiveType(_type)
 		&& (missingCount || addedCount)) {
 		Depur::append(
 			QStringLiteral("[DEPUR] FILL type=%1 slice=%2 added=%3 "
@@ -617,6 +646,9 @@ void Provider::requestMissingAround(
 			// no hay peticiones en vuelo: inFlight == 0).
 			state->missing.clear();
 			state->startMore = nullptr;
+			// Rebuild de la rejilla tras el pase: re-dispara requestMissingAround
+			// para los huecos que sigan (reintento encadenado barato con slice
+			// pequeña).
 			_refreshed.fire({});
 			return;
 		}
@@ -691,7 +723,7 @@ void Provider::jumpToMessage(
 		if (callback) {
 			callback(fullId);
 		}
-		_idsLimit = (_type == Type::FilesPhotos || _type == Type::All)
+		_idsLimit = WideWindowType(_type)
 			? kFullIdsLimit
 			: kMinimalIdsLimit * 2;
 		refreshViewer();
@@ -705,7 +737,10 @@ void Provider::jumpToMessage(
 			_type,
 			messageId,
 			Data::LoadDirection::Around,
-			result);
+			result,
+			// Mismo criterio de aceptación que la carga normal: en "Archivos"
+			// no se descarta ningún adjunto, también al saltar a un mensaje.
+			_type == Type::File);
 
 		if (!parsed.messageIds.empty()) {
 			peer->session().storage().add(Storage::SharedMediaAddSlice(
@@ -887,7 +922,10 @@ std::unique_ptr<BaseLayout> Provider::createLayout(
 			return std::make_unique<Document>(
 				delegate,
 				item,
-				DocumentFields{ .document = file },
+				DocumentFields{
+					.document = file,
+					.hideName = _fileGridColumns > 1,
+				},
 				songSt);
 		}
 		return nullptr;

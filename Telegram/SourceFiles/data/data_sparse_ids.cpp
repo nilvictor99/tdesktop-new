@@ -156,6 +156,7 @@ SparseIdsSliceBuilder::SparseIdsSliceBuilder(
 : _key(key)
 , _limitBefore(limitBefore)
 , _limitAfter(limitAfter) {
+	_walkTimer.setCallback([this] { walkStep(); });
 }
 
 bool SparseIdsSliceBuilder::applyInitial(
@@ -259,6 +260,9 @@ bool SparseIdsSliceBuilder::removeAll() {
 	_fullCount = 0;
 	_skippedBefore = 0;
 	_skippedAfter = 0;
+	_walkNoProgress = 0;
+	_walkLastFront = MsgId(0);
+	_walkEndLogged = false;
 	return true;
 }
 
@@ -326,6 +330,12 @@ void SparseIdsSliceBuilder::mergeSliceData(
 }
 
 void SparseIdsSliceBuilder::fillSkippedAndSliceToLimits() {
+	if (_alwaysPageBefore && _skippedBefore && *_skippedBefore == 0) {
+		// Fijar el conteo exacto ANTES de derivar las colas: así el skippedAfter
+		// que se calcula aquí usa el total real (ids recuperados) y no la
+		// estimación del servidor (que podía producir un valor negativo).
+		maybeFinalizeWalk();
+	}
 	if (_fullCount) {
 		if (_skippedBefore && !_skippedAfter) {
 			_skippedAfter = *_fullCount
@@ -352,9 +362,15 @@ void SparseIdsSliceBuilder::sliceToLimits() {
 	auto removeFromBegin = (aroundIt - _ids.begin() - _limitBefore);
 	auto removeFromEnd = (_ids.end() - aroundIt - _limitAfter - 1);
 	if (removeFromBegin > 0) {
-		_ids.erase(_ids.begin(), _ids.begin() + removeFromBegin);
-		if (_skippedBefore) {
-			*_skippedBefore += removeFromBegin;
+		// En modo caminata NO recortamos el inicio: conservamos todos los ids
+		// recuperados en el builder. Así el conteo exacto es _ids.size() (sin
+		// que los reintegros de la unión del storage re-cuenten ids). El
+		// recorte normal (ventana acotada) se aplica sólo fuera de la caminata.
+		if (!_alwaysPageBefore) {
+			_ids.erase(_ids.begin(), _ids.begin() + removeFromBegin);
+			if (_skippedBefore) {
+				*_skippedBefore += removeFromBegin;
+			}
 		}
 	} else if (removeFromBegin < 0
 		&& (!_skippedBefore || *_skippedBefore > 0)) {
@@ -371,9 +387,18 @@ void SparseIdsSliceBuilder::sliceToLimits() {
 		requestedSomething = true;
 		requestMessages(RequestDirection::After);
 	}
+	if (_alwaysPageBefore && !requestedSomething) {
+		// Caminata completa: aunque la ventana ya esté llena (o el estado
+		// cacheado cubra el ancla), seguimos solicitando páginas anteriores
+		// hasta demostrar el inicio real del historial. El timer interno
+		// (una petición en vuelo, con backoff) alimenta el ciclo en segundo
+		// plano sin bloquear la interfaz.
+		scheduleWalk();
+	}
 	if (!_fullCount && !requestedSomething) {
 		requestMessagesCount();
 	}
+	maybeFinalizeWalk();
 }
 
 void SparseIdsSliceBuilder::requestMessages(
@@ -391,6 +416,88 @@ void SparseIdsSliceBuilder::requestMessages(
 
 void SparseIdsSliceBuilder::requestMessagesCount() {
 	_insufficientAround.fire({ 0, Data::LoadDirection::Around });
+}
+
+void SparseIdsSliceBuilder::setAlwaysPageBefore(bool value) {
+	_alwaysPageBefore = value;
+	if (!value) {
+		_walkTimer.cancel();
+	}
+}
+
+void SparseIdsSliceBuilder::scheduleWalk() {
+	if (!_alwaysPageBefore || _walkTimer.isActive()) {
+		return;
+	}
+	if (_skippedBefore && *_skippedBefore == 0) {
+		// Inicio demostrado: la caminata no tiene nada más que pedir.
+		maybeFinalizeWalk();
+		return;
+	}
+	if (!_limitBefore) {
+		// Viewer sin ventana (messageId == 0): no hay caminata que alimentar.
+		return;
+	}
+	// La caminata avanza pausada: una página y una reconstrucción de rejilla
+	// cada ~1.5 s deja a la UI respirar (en canales de >1000 media, el pase
+	// completo de materialización + relayout por página congelaba la app).
+	constexpr auto kWalkGapMs = 1500;
+	constexpr auto kWalkMaxBackoffShift = 6;
+	const auto delay = kWalkGapMs << qMin(_walkNoProgress, kWalkMaxBackoffShift);
+	_walkTimer.callOnce(delay);
+}
+
+void SparseIdsSliceBuilder::walkStep() {
+	if (!_alwaysPageBefore) {
+		return;
+	}
+	if (_skippedBefore && *_skippedBefore == 0) {
+		maybeFinalizeWalk();
+		return;
+	}
+	const auto front = _ids.empty() ? _key : _ids.front();
+	if (_walkLastFront == front) {
+		// Sin progreso en el frente (petición fallida, página repetida o
+		// red lenta): el backoff del próximo disparo se duplica hasta 32 s.
+		++_walkNoProgress;
+		constexpr auto kWalkMaxWarn = 6;
+		if (_walkNoProgress == 1 || _walkNoProgress == kWalkMaxWarn) {
+			Depur::append(
+				QStringLiteral("[DEPUR] WALK-STALL front=%1 sin-progreso=%2")
+				.arg(Depur::num(front.bare))
+				.arg(Depur::num(_walkNoProgress)));
+		}
+	} else {
+		_walkLastFront = front;
+		_walkNoProgress = 0;
+	}
+	Depur::append(
+		QStringLiteral("[DEPUR] WALK front=%1 ids=%2")
+		.arg(Depur::num(front.bare))
+		.arg(Depur::num(int(_ids.size()))));
+	requestMessages(RequestDirection::Before);
+	scheduleWalk();
+}
+
+void SparseIdsSliceBuilder::maybeFinalizeWalk() {
+	if (!_alwaysPageBefore || !_skippedBefore || *_skippedBefore != 0) {
+		return;
+	}
+	if (!_walkEndLogged) {
+		_walkEndLogged = true;
+		Depur::append(
+			QStringLiteral("[DEPUR] WALK-END ids=%1 fullCount=%2")
+			.arg(Depur::num(int(_ids.size())))
+			.arg(Depur::num(_fullCount.value_or(0))));
+	}
+	// Conteo exacto: al llegar al inicio real, el número de archivos es el
+	// total de ids distintos recuperados (el builder conserva todos en modo
+	// caminata), no la estimación del servidor que suma los fullCount de
+	// cada sub-filtro.
+	const auto exact = int(_ids.size());
+	if (_fullCount != exact) {
+		_fullCount = exact;
+	}
 }
 
 SparseIdsSlice SparseIdsSliceBuilder::snapshot() const {

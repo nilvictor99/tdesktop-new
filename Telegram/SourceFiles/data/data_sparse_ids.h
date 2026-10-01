@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "data/data_abstract_sparse_ids.h"
 #include "data/data_messages.h"
+#include "base/timer.h"
 
 namespace Storage {
 struct SparseIdsListResult;
@@ -158,6 +159,12 @@ public:
 	bool invalidateBottom();
 
 	void checkInsufficient();
+	// «Caminata completa»: con esto activado (módulos FilesPhotos/All/File) el
+	// builder sigue solicitando páginas anteriores hasta demostrar el inicio
+	// real del historial, incluso cuando la ventana ya está llena. Lo alimenta
+	// un timer interno con backoff (una petición en vuelo, pausa mínima) para
+	// no agobiar a la API, y se detiene solo al llegar al principio.
+	void setAlwaysPageBefore(bool value);
 	struct AroundData {
 		MsgId aroundId = 0;
 		Data::LoadDirection direction = Data::LoadDirection::Around;
@@ -183,6 +190,9 @@ private:
 	void requestMessagesCount();
 	void fillSkippedAndSliceToLimits();
 	void sliceToLimits();
+	void scheduleWalk();
+	void walkStep();
+	void maybeFinalizeWalk();
 
 	void mergeSliceData(
 		std::optional<int> count,
@@ -197,6 +207,13 @@ private:
 	std::optional<int> _skippedAfter;
 	int _limitBefore = 0;
 	int _limitAfter = 0;
+
+	// Modo «caminata completa» (siempre más páginas anteriores hasta el inicio).
+	bool _alwaysPageBefore = false;
+	base::Timer _walkTimer;
+	int _walkNoProgress = 0;
+	MsgId _walkLastFront = 0;
+	bool _walkEndLogged = false;
 
 	rpl::event_stream<AroundData> _insufficientAround;
 

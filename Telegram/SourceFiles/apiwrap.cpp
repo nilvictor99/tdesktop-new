@@ -70,6 +70,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "data/data_chat_filters.h"
 #include "data/data_histories.h"
+#include "data/data_msg_id.h"
 #include "data/data_history_messages.h"
 #include "core/core_cloud_password.h"
 #include "core/application.h"
@@ -3697,13 +3698,18 @@ void ApiWrap::requestSharedMedia(
 				type,
 				messageId,
 				slice,
-				result);
+				result,
+				// En "Archivos" no filtramos por subtipo: una sola búsqueda
+				// devuelve todos los adjuntos del chat, sin que quede ninguno
+				// fuera por el criterio de aceptación por defecto.
+				type == SharedMediaType::File);
 			sharedMediaDone(
 				peer,
 				topicRootId,
 				monoforumPeerId,
 				type,
-				std::move(parsed));
+				std::move(parsed),
+				parsed.fullCount);
 			finish();
 		}).fail([=] {
 			_sharedMediaRequests.remove(key);
@@ -3729,6 +3735,108 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 	};
 	_sharedMediaRequests.emplace(key);
 
+	// Normalización de ancla inicial: Around con messageId=0 se interpreta como
+	// el borde superior del historial (ServerMaxMsgId-1) para evitar peticiones
+	// vacías que dejan la unión en blanco.
+	auto baseMsgId = messageId;
+	if (slice == SliceType::Around && baseMsgId == MsgId(0)) {
+		baseMsgId = MsgId(ServerMaxMsgId - 1);
+		Depur::append(
+			QStringLiteral("[DEPUR] FP ANCHOR-FIX peer=%1 msgId=0 -> %2")
+			.arg(Depur::num(peer->id.value))
+			.arg(Depur::num(baseMsgId.bare)));
+	}
+
+	const auto keyState = std::make_shared<FilesPhotosPagingKey>(
+		FilesPhotosPagingKey{ peer, topicRootId, monoforumPeerId });
+	const auto pagingFor = [=]() -> FilesPhotosPagingState& {
+		return _filesPhotosPaging[*keyState];
+	};
+	if (slice == SliceType::Around) {
+		// Nueva sesión / salto de mensaje: ambos lados parten del ancla común.
+		// Los frentes de una sesión anterior ya no son válidos (el `epoch` deja
+		// obsoletas a las páginas que aún estén en vuelo de ese ancla viejo).
+		auto &paging = pagingFor();
+		++paging.epoch;
+		paging.photoFront = paging.fileFront = baseMsgId;
+		paging.photoTop = paging.fileTop = baseMsgId;
+		paging.photoTouched = paging.fileTouched = false;
+		paging.photoStartClosed = paging.fileStartClosed = false;
+		paging.photoTopClosed = paging.fileTopClosed = false;
+		Depur::append(
+			QStringLiteral("[DEPUR] FP RESET peer=%1 around=%2 type=13")
+			.arg(Depur::num(peer->id.value))
+			.arg(Depur::num(baseMsgId.bare)));
+	}
+
+	// FilesPhotos es la UNION de dos secuencias del servidor (Photo + File).
+	// Cada lado pagina desde SU propio frente (el extremo que ya devolvió), no
+	// desde un ancla global: si ambos compartieran ancla, el lado denso (fotos)
+	// saltaría su franja cada vez que el lado ralo (archivos) bajara el frente,
+	// dejando trozos del historial sin cargar. En `Before`, un lado que aún no
+	// recibió ninguna página parte del ancla que pide el builder (que es el
+	// borde de la cobertura ya conocida); en adelante parte de su frente.
+	const auto pickAnchor = [&](MsgId front, MsgId top, bool touched, bool closed) {
+		if (closed) {
+			return std::optional<MsgId>();
+		} else if (slice == SliceType::Before) {
+			return std::optional<MsgId>(touched ? front : baseMsgId);
+		} else if (slice == SliceType::After) {
+			return std::optional<MsgId>(touched ? top : baseMsgId);
+		}
+		return std::optional<MsgId>(baseMsgId);
+	};
+	const auto &pagingSeed = pagingFor();
+	// Sólo el "cerrado" es conjunto, para no agotar la unión antes de tiempo;
+	// los frentes van por separado, como explica `pickAnchor` más arriba.
+	const auto unifiedClosedBefore = pagingSeed.photoStartClosed && pagingSeed.fileStartClosed;
+	std::optional<MsgId> photoAnchor;
+	std::optional<MsgId> fileAnchor;
+	if (slice == SliceType::Before) {
+		photoAnchor = pickAnchor(
+			pagingSeed.photoFront,
+			pagingSeed.photoTop,
+			pagingSeed.photoTouched,
+			unifiedClosedBefore);
+		fileAnchor = pickAnchor(
+			pagingSeed.fileFront,
+			pagingSeed.fileTop,
+			pagingSeed.fileTouched,
+			unifiedClosedBefore);
+	} else if (slice == SliceType::After) {
+		photoAnchor = pickAnchor(
+			pagingSeed.photoFront,
+			pagingSeed.photoTop,
+			pagingSeed.photoTouched,
+			pagingSeed.photoTopClosed);
+		fileAnchor = pickAnchor(
+			pagingSeed.fileFront,
+			pagingSeed.fileTop,
+			pagingSeed.fileTouched,
+			pagingSeed.fileTopClosed);
+	} else {
+		photoAnchor = pickAnchor(baseMsgId, baseMsgId, false, false);
+		fileAnchor  = pickAnchor(baseMsgId, baseMsgId, false, false);
+	}
+	Depur::append(
+		QStringLiteral("[DEPUR] FP ANCHOR peer=%1 slice=%2 base=%3 photoAnchor=%4 fileAnchor=%5 "
+			"photoFront=%6 fileFront=%7 photoTop=%8 fileTop=%9")
+		.arg(Depur::num(peer->id.value))
+		.arg(int(slice))
+		.arg(Depur::num(baseMsgId.bare))
+		.arg(photoAnchor ? Depur::num(photoAnchor->bare) : QStringLiteral("-"))
+		.arg(fileAnchor ? Depur::num(fileAnchor->bare) : QStringLiteral("-"))
+		.arg(Depur::num(pagingSeed.photoFront.bare))
+		.arg(Depur::num(pagingSeed.fileFront.bare))
+		.arg(Depur::num(pagingSeed.photoTop.bare))
+		.arg(Depur::num(pagingSeed.fileTop.bare)));
+	if (!photoAnchor && !fileAnchor) {
+		// Ambos lados ya agotados (en esta dirección): no hay nada más que
+		// pedir para este ancla.
+		_sharedMediaRequests.remove(key);
+		return;
+	}
+
 	struct State {
 		std::optional<Api::SearchResult> photo;
 		std::optional<Api::SearchResult> file;
@@ -3751,27 +3859,40 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 		Expects(state->photo.has_value() && state->file.has_value());
 		const auto allOk = state->photoOk && state->fileOk;
 		auto merged = Api::SearchResult();
-		auto mergeOne = [&](const Api::SearchResult &parsed) {
-			merged.fullCount += parsed.fullCount;
+		auto mergedTotal = 0;
+		auto countsOk = true;
+		auto mergeOne = [&](
+				const Api::SearchResult &parsed,
+				bool live,
+				int storedFullCount) {
 			merged.messageIds.insert(
 				merged.messageIds.end(),
 				parsed.messageIds.begin(),
 				parsed.messageIds.end());
+			// El total de la unión usa cada lado con su conteo REAL del servidor
+			// cuando está disponible; si la respuesta final llegó como `messages`
+			// plano (sin vcount), se conserva el último total fiable conocido.
+			// Un lado cerrado sin conteo fiable NO marca el total como válido.
+			if (parsed.reliableCount) {
+				mergedTotal += parsed.fullCount;
+			} else if (storedFullCount > 0) {
+				mergedTotal += storedFullCount;
+			} else if (live) {
+				countsOk = false;
+				mergedTotal += parsed.fullCount;
+			}
 		};
-		mergeOne(*state->photo);
-		mergeOne(*state->file);
+		mergeOne(*state->photo, photoAnchor.has_value(), pagingFor().photoFullCount);
+		mergeOne(*state->file, fileAnchor.has_value(), pagingFor().fileFullCount);
+		merged.fullCount = mergedTotal;
 		if (!merged.messageIds.empty()) {
 			const auto minmax = std::minmax_element(
 				merged.messageIds.begin(),
 				merged.messageIds.end());
-			// FilesPhotos es la UNION de dos secuencias de servidor (Photo+File).
-			// Antes se forzaba till=ServerMaxMsgId para que el sparse-loader
-			// acumulara todas las páginas en UNA slice, pero ese "tope fantasma"
-			// hacía que el loader creyera que ya abarcaba hasta el mensaje más
-			// nuevo y dejara de pedir hacia abajo (cortaba la lista). Ahora
-			// usamos el rango REAL del lote (min..max de los ids devueltos), de
-			// modo que el loader siga pidiendo las páginas vecinas hasta cubrir
-			// todo el historial.
+			// Los ids van anclados en los frentes propios de cada lado, por lo
+			// que su rango (min..max) se solapa con la cobertura previa y el
+			// sparse-loader une todo en una única slice contigua, sin que el
+			// loader crea que ya abarcó hasta el mensaje más nuevo.
 			merged.noSkipRange = MsgRange{
 				*minmax.first,
 				*minmax.second
@@ -3788,34 +3909,80 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 					"(fallo: no se marca fin de lista)"));
 			return;
 		} else {
-			// Lote vacío pero búsquedas OK. Distinguimos el FIN REAL del
-			// historial (todas las sub-búsquedas llegaron a su inicio, msgId
-			// mínimo de servidor) del caso en que el servidor aún no devolvió
-			// resultados porque la exploración no llegó al tope. Si aún no se
-			// alcanzó el inicio, NO cerramos: omitimos la actualización para
-			// que el loader siga pidiendo las páginas anteriores (evita que
-			// SparseIdsSliceBuilder marque skippedBefore=0 y "corte" la lista
-			// antes de mostrar todo el contenido).
-			const auto federalFrom = qMin(
-				state->photo->noSkipRange.from,
-				state->file->noSkipRange.from);
-			const auto federalTill = qMax(
-				state->photo->noSkipRange.till,
-				state->file->noSkipRange.till);
+			// Lote vacío pero búsquedas OK. Los lados que ya se cerraron en
+			// páginas anteriores participan como sentinelas (no aportan ids),
+			// así que el "fin real" lo deciden sólo los lados que respondieron
+			// EN ESTA página. Si el último lado activo aún no llegó a su inicio
+			// (msgId mínimo de servidor, ~2), no cerramos: omitimos la
+			// actualización para que el loader siga pidiendo páginas anteriores
+			// (evita que SparseIdsSliceBuilder marque skippedBefore=0 y "corte"
+			// la lista antes de mostrar todo el contenido).
+			const auto livePhoto = photoAnchor.has_value();
+			const auto liveFile = fileAnchor.has_value();
+			const auto photoFrom = livePhoto
+				? state->photo->noSkipRange.from
+				: MsgId(0);
+			const auto fileFrom = liveFile
+				? state->file->noSkipRange.from
+				: MsgId(0);
+			const auto photoTill = livePhoto
+				? state->photo->noSkipRange.till
+				: MsgId(0);
+			const auto fileTill = liveFile
+				? state->file->noSkipRange.till
+				: MsgId(0);
+			const auto federalFrom = qMin(photoFrom, fileFrom);
+			const auto federalTill = qMax(photoTill, fileTill);
 			// Los id de mensajes de servidor parten de ~2; un from así de bajo
 			// significa "se llegó al principio del historial".
 			constexpr auto kMinServerMsgId = 2;
-			if (federalFrom > kMinServerMsgId) {
+			// El fin real sólo existe cuando NINGÚN lado vivo sigue explorando.
+			// Un lado que llega hoy a su inicio (from==0/till==ServerMax) se
+			// cierra, pero un lado vivo con rango aún abierto (p.ej. una ventana
+			// descartada con from>2 en `Before`) debe mantener la exploración; de
+			// lo contrario un cierre de un lado arrastraría a la unión entera.
+			const auto anyContinues = [&](
+					bool live,
+					MsgId from,
+					MsgId till) {
+				if (!live) {
+					return false;
+				}
+				switch (slice) {
+				case SliceType::Before:
+					return (from > kMinServerMsgId);
+				case SliceType::After:
+					return (till < ServerMaxMsgId);
+				case SliceType::Around:
+					return (from > kMinServerMsgId)
+						|| (till < ServerMaxMsgId);
+				}
+				Unexpected("SliceType in finishOne");
+			};
+			if (anyContinues(livePhoto, photoFrom, photoTill)
+				|| anyContinues(liveFile, fileFrom, fileTill)) {
 				Depur::append(
-					QStringLiteral("[DEPUR] FP MERGE-SKIP items=0 from=%1 "
-						"(aún no es el inicio; se sigue explorando)")
-					.arg(Depur::num(federalFrom.bare)));
+					QStringLiteral("[DEPUR] FP MERGE-SKIP items=0 "
+						"(aún se explora; sin cierre)"));
 				return;
 			}
 			// Fin real: propagar el rango para que el loader cierre de forma
-			// limpia, sin sobreescribir el fullCount de la unión.
+			// limpia.
 			merged.noSkipRange = MsgRange{ federalFrom, federalTill };
 		}
+		// Protección del conteo: si alguna sub-búsqueda falló, o algún lado no
+		// aportó un total fiable, el sumatorio (ya con un 0 por el lado caído)
+		// infravaloraría el total almacenado y provocaría "fines de lista"
+		// prematuros. Sólo escribimos el conteo cuando TODO es fiable.
+		const auto fullCountToSave = (allOk && countsOk)
+			? std::optional<int>(merged.fullCount)
+			: std::nullopt;
+		Depur::append(
+			QStringLiteral("[DEPUR] FP MERGE photoItems=%1 fileItems=%2 totalItems=%3 allOk=%4")
+			.arg(Depur::num(state->photo ? state->photo->messageIds.size() : 0))
+			.arg(Depur::num(state->file ? state->file->messageIds.size() : 0))
+			.arg(Depur::num(merged.messageIds.size()))
+			.arg(allOk ? 1 : 0));
 		Depur::append(
 			QStringLiteral("[DEPUR] FP APPLY items=%1 count=%2 nsk=%3..%4 allOk=%5")
 			.arg(Depur::num(merged.messageIds.size()))
@@ -3828,18 +3995,122 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 			topicRootId,
 			monoforumPeerId,
 			SharedMediaType::FilesPhotos,
-			std::move(merged));
+			std::move(merged),
+			fullCountToSave);
+	};
+
+	const auto pageEpoch = std::make_shared<int>(pagingFor().epoch);
+	const auto updatePagingFrom = [=](
+			SharedMediaType type,
+			const Api::SearchResult &result,
+			bool droppedPage,
+			std::optional<MsgRange> rawRange) {
+		auto &paging = pagingFor();
+		if (paging.epoch != *pageEpoch) {
+			// La página pertenece a una sesión anterior (el usuario saltó a
+			// otro ancla): sus ids se mergean al storage (son válidos), pero
+			// NO deben avanzar los frentes de la sesión nueva.
+			return;
+		}
+		const auto photo = (type == SharedMediaType::Photo);
+		auto &front = photo ? paging.photoFront : paging.fileFront;
+		auto &top = photo ? paging.photoTop : paging.fileTop;
+		auto &touched = photo ? paging.photoTouched : paging.fileTouched;
+		const auto setClosed = [&](bool value) {
+			if (photo) {
+				if (slice == SliceType::After) {
+					paging.photoTopClosed = value;
+				} else {
+					paging.photoStartClosed = value;
+				}
+			} else {
+				if (slice == SliceType::After) {
+					paging.fileTopClosed = value;
+				} else {
+					paging.fileStartClosed = value;
+				}
+			}
+		};
+		touched = true;
+		// Sólo un total real del servidor (vcount) debe conservarse como
+		// "último fullCount conocido": el tamaño de una página final (constructor
+		// `messages` plano) no es un total y corrompería la estimación de la
+		// unión si llegara a usarse para un lado ya cerrado.
+		if (result.reliableCount) {
+			if (photo) {
+				paging.photoFullCount = result.fullCount;
+			} else {
+				paging.fileFullCount = result.fullCount;
+			}
+		}
+		if (!result.messageIds.empty()) {
+			const auto minmax = std::minmax_element(
+				result.messageIds.begin(),
+				result.messageIds.end());
+			front = qMin(front, *minmax.first);
+			top = qMax(top, *minmax.second);
+		} else if (droppedPage && rawRange) {
+			// Ventana descartada: el servidor devolvió mensajes pero la máscara
+			// local no aceptó ninguno (no son contenido FilesPhotos). Sus ids
+			// marcan el nuevo frente (no hay que re-visitarlos) y NO es un cierre.
+			front = qMin(front, rawRange->from);
+			top = qMax(top, rawRange->till);
+		}
+		// Los frentes NO se sincronizan entre lados en `Before`: cada uno avanza
+		// sólo con las páginas de su propio lado (`touched`, más arriba), o el
+		// lado denso volvería a recorrer la franja del lado ralo en cada página.
+		// Sincronización de top solo para After para evitar adelantamientos.
+		if (slice == SliceType::After) {
+			if (photo) {
+				paging.fileTop = qMax(paging.fileTop, top);
+				paging.fileTouched = true;
+			} else {
+				paging.photoTop = qMax(paging.photoTop, top);
+				paging.photoTouched = true;
+			}
+		}
+		Depur::append(
+			QStringLiteral("[DEPUR] FP PAGING type=%1 slice=%2 front=%3 top=%4 "
+				"photoFront=%5 fileFront=%6 photoTop=%7 fileTop=%8")
+			.arg(photo ? u"Photo"_q : u"File"_q)
+			.arg(int(slice))
+			.arg(Depur::num(front.bare))
+			.arg(Depur::num(top.bare))
+			.arg(Depur::num(paging.photoFront.bare))
+			.arg(Depur::num(paging.fileFront.bare))
+			.arg(Depur::num(paging.photoTop.bare))
+			.arg(Depur::num(paging.fileTop.bare)));
+		if (droppedPage) {
+			return;
+		}
+		const auto reachedEnd = [&] {
+			if (!result.messageIds.empty()) {
+				return false;
+			}
+			switch (slice) {
+			case SliceType::Before:
+				return result.noSkipRange.from == 0;
+			case SliceType::After:
+				return result.noSkipRange.till == ServerMaxMsgId;
+			case SliceType::Around:
+				return (result.noSkipRange.from == 0)
+					&& (result.noSkipRange.till == ServerMaxMsgId);
+			}
+			Unexpected("SliceType in updatePagingFrom");
+		}();
+		if (reachedEnd) {
+			setClosed(true);
+			Depur::append(
+				QStringLiteral("[DEPUR] FP CLOSE type=%1 dir=%2")
+				.arg(photo ? u"Photo"_q : u"File"_q)
+				.arg(int(slice)));
+		}
 	};
 
 	const auto sendOne = [=](SharedMediaType type) {
-		const auto prepared = Api::PrepareSearchRequest(
-			peer,
-			topicRootId,
-			monoforumPeerId,
-			type,
-			QString(),
-			messageId,
-			slice);
+		const auto anchor = (type == SharedMediaType::Photo)
+			? photoAnchor
+			: fileAnchor;
 		const auto captured = [&]() -> std::optional<Api::SearchResult>* {
 			if (type == SharedMediaType::Photo) {
 				return &state->photo;
@@ -3858,35 +4129,120 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 			}
 			return u"File"_q;
 		}();
+		if (!anchor) {
+			// Lado ya agotado: participa en el merge como lote vacío correcto,
+			// conservando su último fullCount conocido (no un 0, que
+			// infravaloraría la estimación de la unión).
+			*captured = Api::SearchResult();
+			(*captured)->fullCount = (type == SharedMediaType::Photo)
+				? pagingFor().photoFullCount
+				: pagingFor().fileFullCount;
+			*okFlag = true;
+			Depur::append(
+				QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3 CERRADO")
+				.arg(typeName).arg(Depur::num(baseMsgId.bare))
+				.arg(int(slice)));
+			finishOne();
+			return;
+		}
+		const auto prepared = Api::PrepareSearchRequest(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			type,
+			QString(),
+			*anchor,
+			slice);
 		if (!prepared) {
 			*captured = Api::SearchResult();
+			*okFlag = true;
 			Depur::append(
 				QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3 "
-					"NO-PREPARADO").arg(typeName).arg(Depur::num(messageId.bare))
+					"NO-PREPARADO").arg(typeName).arg(Depur::num((*anchor).bare))
 				.arg(int(slice)));
 			finishOne();
 			return;
 		}
 		Depur::append(
 			QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3")
-			.arg(typeName).arg(Depur::num(messageId.bare)).arg(int(slice)));
+			.arg(typeName).arg(Depur::num((*anchor).bare)).arg(int(slice)));
 		historiesPtr->sendRequest(history, requestType, [=](Fn<void()> finish) {
 			return request(std::move(*prepared)
 			).done([=](const Api::SearchRequestResult &result) {
-				*captured = Api::ParseSearchResult(
-					peer,
-					type,
-					messageId,
-					slice,
-					result);
-				*okFlag = true;
+			// Antes de parsear, registramos los mensajes BRUTOS que devolvió el
+			// servidor: si todos se descartan al aplicar la máscara local, no es
+			// un fin de lista sino una ventana sin contenido aprovechable.
+			auto rawCount = 0;
+			auto rawMin = MsgId(ServerMaxMsgId);
+			auto rawMax = MsgId(0);
+			const auto foldRaw = [&](const QVector<MTPMessage> &vectors) {
+				rawCount = 0;
+				for (const auto &message : vectors) {
+					++rawCount;
+					const auto id = message.match([](const MTPDmessage &d) {
+						return MsgId(d.vid().v);
+					}, [](const MTPDmessageEmpty &d) {
+						return MsgId(d.vid().v);
+					}, [](const MTPDmessageService &d) {
+						return MsgId(d.vid().v);
+					});
+					if (id < rawMin) {
+						rawMin = id;
+					}
+					if (id > rawMax) {
+						rawMax = id;
+					}
+				}
+			};
+			switch (result.type()) {
+			case mtpc_messages_messages:
+				foldRaw(result.c_messages_messages().vmessages().v);
+				break;
+			case mtpc_messages_messagesSlice:
+				foldRaw(result.c_messages_messagesSlice().vmessages().v);
+				break;
+			case mtpc_messages_channelMessages:
+				foldRaw(result.c_messages_channelMessages().vmessages().v);
+				break;
+			case mtpc_messages_messagesNotModified:
+				break;
+			}
+		*captured = Api::ParseSearchResult(
+			peer,
+			type,
+			*anchor,
+			slice,
+			result,
+			// Para FilesPhotos aceptar toda media para asegurar que fotos y archivos
+			// se materialicen y se puedan seleccionar sin abrir chat. Lote adaptativo
+			// evita saturación.
+			true);
+			*okFlag = true;
+			const auto droppedPage = (rawCount > 0)
+				&& (*captured)->messageIds.empty();
+			const auto rawRange = droppedPage
+				? std::optional<MsgRange>(MsgRange{ rawMin, rawMax })
+				: std::nullopt;
+			if (droppedPage) {
+				// La ventana descartada no es un fin de lista: sus ids quedan
+				// registrados como cobertura (no son contenido FilesPhotos) para
+				// que el frente avance por encima de ellos.
+				(*captured)->noSkipRange = MsgRange{ rawMin, rawMax };
 				Depur::append(
-					QStringLiteral("[DEPUR] FP DONE type=%1 items=%2 nsk=%3..%4 "
-						"fullCount=%5").arg(typeName)
+					QStringLiteral("[DEPUR] FP DROP type=%1 nsk=%2..%3 "
+						"(ventana descartada; no es cierre)").arg(typeName)
+						.arg(Depur::num(rawMin.bare))
+						.arg(Depur::num(rawMax.bare)));
+			}
+			updatePagingFrom(type, **captured, droppedPage, rawRange);
+			Depur::append(
+				QStringLiteral("[DEPUR] FP DONE type=%1 items=%2 nsk=%3..%4 "
+					"fullCount=%5 reliable=%6").arg(typeName)
 					.arg(Depur::num((*captured)->messageIds.size()))
 					.arg(Depur::num((*captured)->noSkipRange.from.bare))
 					.arg(Depur::num((*captured)->noSkipRange.till.bare))
-					.arg(Depur::num((*captured)->fullCount)));
+					.arg(Depur::num((*captured)->fullCount))
+					.arg((*captured)->reliableCount ? 1 : 0));
 				finishOne();
 				finish();
 			}).fail([=](const MTP::Error &error, mtpRequestId requestId) {
@@ -4032,7 +4388,8 @@ void ApiWrap::requestSharedMediaAll(
 			topicRootId,
 			monoforumPeerId,
 			SharedMediaType::All,
-			std::move(merged));
+			std::move(merged),
+			merged.fullCount);
 	};
 
 	const auto sendOne = [=](SharedMediaType type) {
@@ -4083,16 +4440,16 @@ void ApiWrap::requestSharedMediaAll(
 		historiesPtr->sendRequest(history, requestType, [=](Fn<void()> finish) {
 			return request(std::move(*prepared)
 			).done([=](const Api::SearchRequestResult &result) {
-				*captured = Api::ParseSearchResult(
-					peer,
-					type,
-					messageId,
-					slice,
-					result);
-				*okFlag = true;
-				Depur::append(
-					QStringLiteral("[DEPUR] ALL DONE type=%1 items=%2 nsk=%3..%4 "
-						"fullCount=%5").arg(typeName)
+			*captured = Api::ParseSearchResult(
+				peer,
+				type,
+				messageId,
+				slice,
+				result);
+			*okFlag = true;
+			Depur::append(
+				QStringLiteral("[DEPUR] ALL DONE type=%1 items=%2 nsk=%3..%4 "
+					"fullCount=%5").arg(typeName)
 					.arg(Depur::num((*captured)->messageIds.size()))
 					.arg(Depur::num((*captured)->noSkipRange.from.bare))
 					.arg(Depur::num((*captured)->noSkipRange.till.bare))
@@ -4123,7 +4480,8 @@ void ApiWrap::sharedMediaDone(
 		MsgId topicRootId,
 		PeerId monoforumPeerId,
 		SharedMediaType type,
-		Api::SearchResult &&parsed) {
+		Api::SearchResult &&parsed,
+		std::optional<int> fullCount) {
 	const auto topic = peer->forumTopicFor(topicRootId);
 	const auto sublist = peer->monoforumSublistFor(monoforumPeerId);
 	if ((topicRootId && !topic) || (monoforumPeerId && !sublist)) {
@@ -4137,7 +4495,7 @@ void ApiWrap::sharedMediaDone(
 		type,
 		std::move(parsed.messageIds),
 		parsed.noSkipRange,
-		parsed.fullCount
+		fullCount
 	));
 	if (type == SharedMediaType::Pinned && hasMessages) {
 		peer->owner().history(peer)->setHasPinnedMessages(true);

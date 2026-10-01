@@ -192,6 +192,8 @@ public:
 	[[nodiscard]] virtual bool supportsMediaFilter() const {
 		return false;
 	}
+	virtual void setFileGridColumns(int columns) {
+	}
 
 	[[nodiscard]] virtual bool anchorWhileAtTop() {
 		return false;

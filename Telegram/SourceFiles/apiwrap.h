@@ -595,7 +595,8 @@ private:
 		MsgId topicRootId,
 		PeerId monoforumPeerId,
 		SharedMediaType type,
-		Api::SearchResult &&parsed);
+		Api::SearchResult &&parsed,
+		std::optional<int> fullCount = std::nullopt);
 	void globalMediaDone(
 		SharedMediaType type,
 		FullMsgId messageId,
@@ -752,6 +753,50 @@ private:
 			const SharedMediaRequest&) = default;
 	};
 	base::flat_set<SharedMediaRequest> _sharedMediaRequests;
+
+	// Frentes de paginado independientes por sub-búsqueda del módulo compuesto
+	// Fotos+Archivos. FilesPhotos es la UNION de dos secuencias del servidor
+	// (Photo + File); si ambas páginas comparten un único ancla "global", el
+	// lado denso (fotos) salta su propia franja cada vez que el lado ralo
+	// (archivos) arrastra el frente, dejando contenido sin cargar. Cada lado
+	// avanza desde SU frente, de modo que las dos secuencias se agotan por
+	// completo. `front`/`top` son los extremos ya cubiertos por cada lado;
+	// `closed` indica que ese lado llegó a su fin real (vacío + rango completo).
+	struct FilesPhotosPagingKey {
+		not_null<PeerData*> peer;
+		MsgId topicRootId = 0;
+		PeerId monoforumPeerId = 0;
+
+		friend inline auto operator<=>(
+			const FilesPhotosPagingKey&,
+			const FilesPhotosPagingKey&) = default;
+	};
+	struct FilesPhotosPagingState {
+		MsgId photoFront = 0;
+		MsgId fileFront = 0;
+		MsgId photoTop = 0;
+		MsgId fileTop = 0;
+		bool photoTouched = false;
+		bool fileTouched = false;
+		// Cierre POR DIRECCIÓN: un lado puede haber llegado a su inicio (no hay
+		// contenido más antiguo; bloquea Before) sin haber alcanzado todavía su
+		// tope (After sigue activo), y viceversa.
+		bool photoStartClosed = false;
+		bool fileStartClosed = false;
+		bool photoTopClosed = false;
+		bool fileTopClosed = false;
+		// Último fullCount conocido del servidor por lado: al cerrarse un lado
+		// (ya no se vuelve a preguntar), su lote vacío debe conservar este
+		// conteo y no un 0, o la estimación de la unión quedaría infravalorada.
+		int photoFullCount = 0;
+		int fileFullCount = 0;
+		// Se incrementa en cada reset de ancla (Around): deja obsoletas a las
+		// páginas aún en vuelo de una sesión anterior.
+		int epoch = 0;
+	};
+	base::flat_map<
+		FilesPhotosPagingKey,
+		FilesPhotosPagingState> _filesPhotosPaging;
 
 	struct HistoryRequest {
 		not_null<PeerData*> peer;
