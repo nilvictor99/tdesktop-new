@@ -551,6 +551,8 @@ infoIconMediaPhoto: icon {{ "info/info_media_photo", infoIconFg }};
 infoIconMediaVideo: icon {{ "info/info_media_video", infoIconFg }};
 infoIconMediaGif: icon {{ "info/info_media_gif", infoIconFg }};
 infoIconMediaFile: icon {{ "info/info_media_file", infoIconFg }};
+infoIconMediaPhotosFiles: icon {{ "info/info_media_files_photo", infoIconFg }};
+infoIconMediaAll: icon {{ "info/info_media_all", infoIconFg }};
 infoIconMediaAudio: icon {{ "info/info_media_audio", infoIconFg }};
 infoIconMediaLink: icon {{ "info/info_media_link", infoIconFg }};
 infoIconMediaGroup: icon {{ "info/info_common_groups", infoIconFg }};

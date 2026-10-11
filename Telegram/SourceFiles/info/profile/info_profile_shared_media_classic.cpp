@@ -347,8 +347,8 @@ object_ptr<Ui::SlideWrap<Ui::RpWidget>> SetupSharedMediaClassic(
 	}
 	addMediaButton(MediaType::PhotoVideo, st::infoIconMediaPhoto);
 	addMediaButton(MediaType::File, st::infoIconMediaFile);
-	addMediaButton(MediaType::FilesPhotos, st::infoIconMediaPhoto);
-	addMediaButton(MediaType::All, st::infoIconMediaPhoto);
+	addMediaButton(MediaType::FilesPhotos, st::infoIconMediaPhotosFiles);
+	addMediaButton(MediaType::All, st::infoIconMediaAll);
 	addMediaButton(MediaType::MusicFile, st::infoIconMediaAudio);
 	addMediaButton(MediaType::Link, st::infoIconMediaLink);
 	addMediaButton(MediaType::Poll, st::infoIconMediaPoll);
