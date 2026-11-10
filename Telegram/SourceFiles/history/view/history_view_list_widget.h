@@ -672,6 +672,7 @@ private:
 	void mouseActionCancel();
 	std::unique_ptr<QMimeData> prepareDrag();
 	void performDrag();
+	void performQuickShowInChat();
 	style::cursor computeMouseCursor() const;
 	int itemTop(not_null<const Element*> view) const;
 	void repaintItem(FullMsgId itemId);
@@ -1007,6 +1008,9 @@ private:
 	crl::time _touchAccelerationTime = 0;
 	crl::time _touchTime = 0;
 	base::Timer _touchScrollTimer;
+	base::Timer _quickShowTimer;
+	FullMsgId _quickShowId;
+	bool _quickShowSuppressed = false;
 	Ui::MiddleClickAutoscroll _middleClickAutoscroll;
 
 	rpl::event_stream<FullMsgId> _requestedToEditMessage;

@@ -250,4 +250,35 @@ funciones está en `00-INDICE.md`; los diseños previos en `02-PLANES.md`.
   - Guard `anyContinues` en `finishOne`: el fin real solo se sella cuando **ningún lado vivo** sigue explorando (Before: `from>2`; After: `till<ServerMax`; Around: cualquiera). Un lado que llega a su inicio hoy se cierra, pero no arrastra a un lado vivo con una ventana descartada por encima.
 - **Trazas nuevas**: `FP DROP`, y `FP DONE` ahora loguea `reliable=%6`.
 - **Alcance**: solo `FilesPhotos`; `All` y el camino simple siguen usando `fullCount` como antes (`reliableCount` se ignora ahí).
+
+## Ronda 27 — All: paginado por lado Photo/Video/File (22-oct-2026)
+- **Problema**: `SharedMediaType::All` (type 14) usaba un solo ancla global para la unión Photo+Video+File en `requestSharedMediaAll`. Con densidades distintas (fotos densas, videos intermedios, archivos ralos) el frente global saltaba franjas y la exploración se estancaba, dejando miniaturas sin renderizar — el mismo defecto estructural que FilesPhotos tenía pre-Ronda 26.
+- **Causa**: el builder `SparseIdsSliceBuilder` pide un `Before/After` con un único `msgId`; `requestSharedMediaAll` lanzaba 3 búsquedas con ese mismo ancla y hacía merge con `noSkipRange` global. El lado más ralo arrastraba el ancla y el lado denso saltaba su propia franja.
+- **Fix** (patrón ya probado en FilesPhotos Ronda 26/26.1):
+  - **Estado por lado** en `apiwrap.h`:
+    - `struct AllMediaPagingKey { not_null<PeerData*> peer; MsgId topicRootId; PeerId monoforumPeerId; }` con `operator<=>`.
+    - `struct AllMediaPagingState` con `photoFront/videoFront/fileFront`, `photoTop/videoTop/fileTop`, flags `*Touched`, `*StartClosed`, `*TopClosed`, `*FullCount` por lado y `epoch`.
+    - `base::flat_map<AllMediaPagingKey, AllMediaPagingState> _allMediaPaging;`
+  - **`requestSharedMediaAll` reescrita** (`apiwrap.cpp`):
+    - Normalización de ancla: `Around` con `messageId==0` → `ServerMaxMsgId-1` para evitar petición vacía.
+    - Reset de frentes por `Around` con incremento de `epoch` (invalida páginas en vuelo de sesión anterior).
+    - `pickAnchor` por lado: `Before` usa `front` si `touched`, si no `baseMsgId`; `After` usa `top`; si el lado está `closed` → `nullopt`.
+    - Cada lado se pide con su ancla propia (`sendOne(Photo/Video/File)`), se actualiza `photoFront/videoFront/fileFront` y `photoTop/videoTop/fileTop` con `qMin/qMax`, y se marca `*Touched`.
+    - `updatePagingFrom`:
+      - Ignora páginas de epoch anterior.
+      - Conserva `fullCount` por lado solo si `result.reliableCount`.
+      - Avanza frentes con los ids del lote; si la ventana está descartada (`rawCount>0 && messageIds.empty()`) se registra `ALL DROP` y se avanza frente sin cerrar.
+      - Cada lado cierra su extremo propio (`*StartClosed`/`*TopClosed`) cuando el rango toca el límite del servidor.
+      - Cross-sync de topos en `After` para mantener la cobertura.
+    - `finishOne`:
+      - Merge de 3 `Api::SearchResult` con `mergedTotal` usando conteos fiables o último conocido.
+      - `anyContinues` para decidir si aún hay exploración por lado vivo (evita cierre falso).
+      - Lote vacío con fallo → `MERGE-SKIP` sin tocar el estado (no se escribe `noSkipRange {0,0}`).
+      - `sharedMediaDone` con `fullCountToSave` solo si `allOk && countsOk`.
+    - Trazas `DEPUR`: `ALL ANCHOR-FIX`, `ALL RESET`, `ALL ANCHOR`, `ALL SEND`, `ALL DONE`, `ALL DROP`, `ALL PAGING`, `ALL CLOSE`, `ALL FAIL`, `ALL MERGE-SKIP`.
+  - Corrección de cierre de lambda `sendRequest` en `sendOne` (faltaba `});` → `});` + `};`).
+- **Alcance**: únicamente `SharedMediaType::All`. `FilesPhotos`/`Media` sin cambios; el resto del stack de paginación se mantiene.
+- **Verificación esperada**: en scroll largo `ALL SEND` de Photo/Video/File diverge en `msgId`, aparecen `ALL CLOSE` por lado, el rango aplicado baja hasta inicio real y `missing` llega a 0; las miniaturas se renderizan de forma continua sin bloqueos.
+- **Historial**: la mejora es la réplica directa de la Ronda 26 para FilesPhotos (per-side paging + merge encadenado + conteo fiable + ventanas descartadas). `All` queda consistente con `FilesPhotos`.
+
 - **Verificación esperada**: `FP APPLY count=7709` constante hasta el cierre (nunca degradado), `FP DROP` en chats con ventanas de stickers/efímeros sin romper la exploración, y la unión completa sin congelarse por conteo bajo.
