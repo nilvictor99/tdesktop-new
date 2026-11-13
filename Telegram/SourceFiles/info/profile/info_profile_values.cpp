@@ -611,12 +611,14 @@ rpl::producer<int> SharedMediaCountValue(
 		});
 	}
 	if (type == Type::All) {
+		// "Todo" is the union of "Fotos" and "Archivos"; in this build the
+		// Files query already brings every document (videos included), so
+		// adding Type::Video here would count them twice.
 		return rpl::combine(
 			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Photo),
-			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Video),
 			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::File)
-		) | rpl::map([](int photos, int videos, int files) {
-			return photos + videos + files;
+		) | rpl::map([](int photos, int files) {
+			return photos + files;
 		});
 	}
 	auto aroundId = 0;
