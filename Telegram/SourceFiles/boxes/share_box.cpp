@@ -1931,9 +1931,9 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 				| (options.suggest ? Flag::f_suggested_post : Flag())
 				| (options.effectId ? Flag::f_effect : Flag());
 			constexpr auto kMassBatchSize = 100;
-			constexpr auto kMassBatchDelay = crl::time(300);
-			constexpr auto kMaxFloodRetries = 5;
-			constexpr auto kMaxFloodWaitSec = 60;
+			constexpr auto kMassBatchMinDelayMs = crl::time(5000);
+			constexpr auto kMassBatchMaxDelayMs = crl::time(300000);
+			constexpr auto kMassFloodWallSec = 7200;
 
 			auto parts = std::vector<QVector<MTPint>>();
 			parts.reserve((msgCount + kMassBatchSize - 1) / kMassBatchSize);
@@ -1962,7 +1962,8 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 				}
 			});
 			const auto idx = std::make_shared<int>(0);
-			const auto retries = std::make_shared<int>(0);
+			const auto pauseMs = std::make_shared<crl::time>(
+				kMassBatchMinDelayMs);
 
 			const auto qweak = std::weak_ptr<MassQueue>(queue);
 			const auto threadDone = [=] {
@@ -1988,7 +1989,7 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 			queue->step = [weak = std::weak_ptr<MassQueue>(queue),
 				parts = std::move(parts),
 				idx,
-				retries,
+				pauseMs,
 				state,
 				show,
 				historiesPtr = &histories,
@@ -2076,12 +2077,15 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 						}
 						progress->sent += int(part.size());
 						updateMassProgress();
-						*retries = 0;
 						++(*idx);
+						// Pacing adaptativo: acercarse al ritmo mínimo.
+						*pauseMs = std::max(
+							kMassBatchMinDelayMs,
+							*pauseMs - crl::time(2000));
 						if (*idx >= int(parts.size())) {
 							threadDone();
 						} else if (const auto s = weak.lock()) {
-							s->timer.callOnce(kMassBatchDelay);
+							s->timer.callOnce(*pauseMs);
 						}
 						finishRequest(requestKey);
 					},
@@ -2089,15 +2093,20 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 							const MTP::Response &) {
 						const auto type = error.type();
 						const auto floodPrefix = u"FLOOD_WAIT_"_q;
-						if (type.startsWith(floodPrefix)
-							&& (*retries < kMaxFloodRetries)) {
+						if (type.startsWith(floodPrefix)) {
+							// FLOOD_WAIT:<secs>: esperar el tiempo REAL que
+							// pide el servidor (dosificado a kMassFloodWallSec)
+							// y reintentar el Mismo part: nunca se salta.
 							const auto secs = std::clamp(
 								base::StringViewMid(
 									type,
 									floodPrefix.size()).toInt(),
 								1,
-								kMaxFloodWaitSec);
-							++(*retries);
+								kMassFloodWallSec);
+							// Pacing adaptativo: esperar más la próxima vez.
+							*pauseMs = std::min(
+								kMassBatchMaxDelayMs,
+								*pauseMs * 2);
 							state->requests.remove(requestKey);
 							if (const auto s = weak.lock()) {
 								s->timer.callOnce(secs * crl::time(1000));
@@ -2117,12 +2126,11 @@ ShareBox::SubmitCallback ShareBox::DefaultForwardCallback(
 									lt_user,
 									peer->name()));
 						}
-						*retries = 0;
 						++(*idx);
 						if (*idx >= int(parts.size())) {
 							threadDone();
 						} else if (const auto s = weak.lock()) {
-							s->timer.callOnce(kMassBatchDelay);
+							s->timer.callOnce(*pauseMs);
 						}
 						finishRequest(requestKey);
 					});

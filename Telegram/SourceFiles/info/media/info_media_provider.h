@@ -53,6 +53,7 @@ public:
 	void setMediaFilter(MediaFilter filter) override;
 	[[nodiscard]] MediaFilter mediaFilter() const override { return _filter; }
 	[[nodiscard]] bool supportsMediaFilter() const override;
+	void setFileGridColumns(int columns) override;
 
 	[[nodiscard]] bool anchorWhileAtTop() override;
 
@@ -134,6 +135,9 @@ private:
 
 	UniversalMsgId _universalAroundId = kDefaultAroundId;
 	int _idsLimit = kMinimalIdsLimit;
+	// Columnas forzadas del módulo "Archivos": 0 = lista, >1 = galería. Solo en
+	// galería se reconstruyen los layouts con el nombre del archivo oculto.
+	int _fileGridColumns = 0;
 	SparseIdsMergedSlice _slice;
 
 	// Advanced self-healing for composite types (FilesPhotos/All): a slice may
@@ -150,8 +154,8 @@ private:
 	// Cuenta cuántas pasadas de materialización seguidas hemos hecho para
 	// llenar ids que siguen sin HistoryItem. Se limita para no reintentar en
 	// bucle infinito cuando un id no existe de verdad (p.ej. borrado). Con la
-	// materialización proactiva de la ventana grande (8-10 lotes por slice en
-	// canales grandes) damos varias pasadas para tolerar fallos transitorios.
+	// ventana pequeña de scroll cada pase es de 1-3 lotes y se refresca por
+	// zona, tolerando fallos transitorios sin congelar la cuadrícula.
 	int _missingRetries = 0;
 	static constexpr int kMaxMissingRetries = 8;
 

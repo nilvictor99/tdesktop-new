@@ -8,6 +8,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "apiwrap.h"
 
 #include <functional>
+#include <QtCore/QSet>
+#include <QtCore/QFile>
+#include <QtCore/QDataStream>
 
 #include "debug_depurador.h"
 #include "api/api_authorizations.h"
@@ -67,12 +70,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "data/data_chat_filters.h"
 #include "data/data_histories.h"
+#include "data/data_msg_id.h"
 #include "data/data_history_messages.h"
 #include "core/core_cloud_password.h"
 #include "core/application.h"
+#include "base/timer.h"
+#include "base/weak_ptr.h"
 #include "base/unixtime.h"
 #include "base/random.h"
 #include "base/call_delayed.h"
+#include "crl/crl.h"
+#include <optional>
 #include "lang/lang_keys.h"
 #include "mainwidget.h"
 #include "boxes/add_contact_box.h"
@@ -3690,13 +3698,18 @@ void ApiWrap::requestSharedMedia(
 				type,
 				messageId,
 				slice,
-				result);
+				result,
+				// En "Archivos" no filtramos por subtipo: una sola búsqueda
+				// devuelve todos los adjuntos del chat, sin que quede ninguno
+				// fuera por el criterio de aceptación por defecto.
+				type == SharedMediaType::File);
 			sharedMediaDone(
 				peer,
 				topicRootId,
 				monoforumPeerId,
 				type,
-				std::move(parsed));
+				std::move(parsed),
+				parsed.fullCount);
 			finish();
 		}).fail([=] {
 			_sharedMediaRequests.remove(key);
@@ -3722,6 +3735,108 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 	};
 	_sharedMediaRequests.emplace(key);
 
+	// Normalización de ancla inicial: Around con messageId=0 se interpreta como
+	// el borde superior del historial (ServerMaxMsgId-1) para evitar peticiones
+	// vacías que dejan la unión en blanco.
+	auto baseMsgId = messageId;
+	if (slice == SliceType::Around && baseMsgId == MsgId(0)) {
+		baseMsgId = MsgId(ServerMaxMsgId - 1);
+		Depur::append(
+			QStringLiteral("[DEPUR] FP ANCHOR-FIX peer=%1 msgId=0 -> %2")
+			.arg(Depur::num(peer->id.value))
+			.arg(Depur::num(baseMsgId.bare)));
+	}
+
+	const auto keyState = std::make_shared<FilesPhotosPagingKey>(
+		FilesPhotosPagingKey{ peer, topicRootId, monoforumPeerId });
+	const auto pagingFor = [=]() -> FilesPhotosPagingState& {
+		return _filesPhotosPaging[*keyState];
+	};
+	if (slice == SliceType::Around) {
+		// Nueva sesión / salto de mensaje: ambos lados parten del ancla común.
+		// Los frentes de una sesión anterior ya no son válidos (el `epoch` deja
+		// obsoletas a las páginas que aún estén en vuelo de ese ancla viejo).
+		auto &paging = pagingFor();
+		++paging.epoch;
+		paging.photoFront = paging.fileFront = baseMsgId;
+		paging.photoTop = paging.fileTop = baseMsgId;
+		paging.photoTouched = paging.fileTouched = false;
+		paging.photoStartClosed = paging.fileStartClosed = false;
+		paging.photoTopClosed = paging.fileTopClosed = false;
+		Depur::append(
+			QStringLiteral("[DEPUR] FP RESET peer=%1 around=%2 type=13")
+			.arg(Depur::num(peer->id.value))
+			.arg(Depur::num(baseMsgId.bare)));
+	}
+
+	// FilesPhotos es la UNION de dos secuencias del servidor (Photo + File).
+	// Cada lado pagina desde SU propio frente (el extremo que ya devolvió), no
+	// desde un ancla global: si ambos compartieran ancla, el lado denso (fotos)
+	// saltaría su franja cada vez que el lado ralo (archivos) bajara el frente,
+	// dejando trozos del historial sin cargar. En `Before`, un lado que aún no
+	// recibió ninguna página parte del ancla que pide el builder (que es el
+	// borde de la cobertura ya conocida); en adelante parte de su frente.
+	const auto pickAnchor = [&](MsgId front, MsgId top, bool touched, bool closed) {
+		if (closed) {
+			return std::optional<MsgId>();
+		} else if (slice == SliceType::Before) {
+			return std::optional<MsgId>(touched ? front : baseMsgId);
+		} else if (slice == SliceType::After) {
+			return std::optional<MsgId>(touched ? top : baseMsgId);
+		}
+		return std::optional<MsgId>(baseMsgId);
+	};
+	const auto &pagingSeed = pagingFor();
+	// Sólo el "cerrado" es conjunto, para no agotar la unión antes de tiempo;
+	// los frentes van por separado, como explica `pickAnchor` más arriba.
+	const auto unifiedClosedBefore = pagingSeed.photoStartClosed && pagingSeed.fileStartClosed;
+	std::optional<MsgId> photoAnchor;
+	std::optional<MsgId> fileAnchor;
+	if (slice == SliceType::Before) {
+		photoAnchor = pickAnchor(
+			pagingSeed.photoFront,
+			pagingSeed.photoTop,
+			pagingSeed.photoTouched,
+			unifiedClosedBefore);
+		fileAnchor = pickAnchor(
+			pagingSeed.fileFront,
+			pagingSeed.fileTop,
+			pagingSeed.fileTouched,
+			unifiedClosedBefore);
+	} else if (slice == SliceType::After) {
+		photoAnchor = pickAnchor(
+			pagingSeed.photoFront,
+			pagingSeed.photoTop,
+			pagingSeed.photoTouched,
+			pagingSeed.photoTopClosed);
+		fileAnchor = pickAnchor(
+			pagingSeed.fileFront,
+			pagingSeed.fileTop,
+			pagingSeed.fileTouched,
+			pagingSeed.fileTopClosed);
+	} else {
+		photoAnchor = pickAnchor(baseMsgId, baseMsgId, false, false);
+		fileAnchor  = pickAnchor(baseMsgId, baseMsgId, false, false);
+	}
+	Depur::append(
+		QStringLiteral("[DEPUR] FP ANCHOR peer=%1 slice=%2 base=%3 photoAnchor=%4 fileAnchor=%5 "
+			"photoFront=%6 fileFront=%7 photoTop=%8 fileTop=%9")
+		.arg(Depur::num(peer->id.value))
+		.arg(int(slice))
+		.arg(Depur::num(baseMsgId.bare))
+		.arg(photoAnchor ? Depur::num(photoAnchor->bare) : QStringLiteral("-"))
+		.arg(fileAnchor ? Depur::num(fileAnchor->bare) : QStringLiteral("-"))
+		.arg(Depur::num(pagingSeed.photoFront.bare))
+		.arg(Depur::num(pagingSeed.fileFront.bare))
+		.arg(Depur::num(pagingSeed.photoTop.bare))
+		.arg(Depur::num(pagingSeed.fileTop.bare)));
+	if (!photoAnchor && !fileAnchor) {
+		// Ambos lados ya agotados (en esta dirección): no hay nada más que
+		// pedir para este ancla.
+		_sharedMediaRequests.remove(key);
+		return;
+	}
+
 	struct State {
 		std::optional<Api::SearchResult> photo;
 		std::optional<Api::SearchResult> file;
@@ -3744,27 +3859,40 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 		Expects(state->photo.has_value() && state->file.has_value());
 		const auto allOk = state->photoOk && state->fileOk;
 		auto merged = Api::SearchResult();
-		auto mergeOne = [&](const Api::SearchResult &parsed) {
-			merged.fullCount += parsed.fullCount;
+		auto mergedTotal = 0;
+		auto countsOk = true;
+		auto mergeOne = [&](
+				const Api::SearchResult &parsed,
+				bool live,
+				int storedFullCount) {
 			merged.messageIds.insert(
 				merged.messageIds.end(),
 				parsed.messageIds.begin(),
 				parsed.messageIds.end());
+			// El total de la unión usa cada lado con su conteo REAL del servidor
+			// cuando está disponible; si la respuesta final llegó como `messages`
+			// plano (sin vcount), se conserva el último total fiable conocido.
+			// Un lado cerrado sin conteo fiable NO marca el total como válido.
+			if (parsed.reliableCount) {
+				mergedTotal += parsed.fullCount;
+			} else if (storedFullCount > 0) {
+				mergedTotal += storedFullCount;
+			} else if (live) {
+				countsOk = false;
+				mergedTotal += parsed.fullCount;
+			}
 		};
-		mergeOne(*state->photo);
-		mergeOne(*state->file);
+		mergeOne(*state->photo, photoAnchor.has_value(), pagingFor().photoFullCount);
+		mergeOne(*state->file, fileAnchor.has_value(), pagingFor().fileFullCount);
+		merged.fullCount = mergedTotal;
 		if (!merged.messageIds.empty()) {
 			const auto minmax = std::minmax_element(
 				merged.messageIds.begin(),
 				merged.messageIds.end());
-			// FilesPhotos es la UNION de dos secuencias de servidor (Photo+File).
-			// Antes se forzaba till=ServerMaxMsgId para que el sparse-loader
-			// acumulara todas las páginas en UNA slice, pero ese "tope fantasma"
-			// hacía que el loader creyera que ya abarcaba hasta el mensaje más
-			// nuevo y dejara de pedir hacia abajo (cortaba la lista). Ahora
-			// usamos el rango REAL del lote (min..max de los ids devueltos), de
-			// modo que el loader siga pidiendo las páginas vecinas hasta cubrir
-			// todo el historial.
+			// Los ids van anclados en los frentes propios de cada lado, por lo
+			// que su rango (min..max) se solapa con la cobertura previa y el
+			// sparse-loader une todo en una única slice contigua, sin que el
+			// loader crea que ya abarcó hasta el mensaje más nuevo.
 			merged.noSkipRange = MsgRange{
 				*minmax.first,
 				*minmax.second
@@ -3781,34 +3909,80 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 					"(fallo: no se marca fin de lista)"));
 			return;
 		} else {
-			// Lote vacío pero búsquedas OK. Distinguimos el FIN REAL del
-			// historial (todas las sub-búsquedas llegaron a su inicio, msgId
-			// mínimo de servidor) del caso en que el servidor aún no devolvió
-			// resultados porque la exploración no llegó al tope. Si aún no se
-			// alcanzó el inicio, NO cerramos: omitimos la actualización para
-			// que el loader siga pidiendo las páginas anteriores (evita que
-			// SparseIdsSliceBuilder marque skippedBefore=0 y "corte" la lista
-			// antes de mostrar todo el contenido).
-			const auto federalFrom = qMin(
-				state->photo->noSkipRange.from,
-				state->file->noSkipRange.from);
-			const auto federalTill = qMax(
-				state->photo->noSkipRange.till,
-				state->file->noSkipRange.till);
+			// Lote vacío pero búsquedas OK. Los lados que ya se cerraron en
+			// páginas anteriores participan como sentinelas (no aportan ids),
+			// así que el "fin real" lo deciden sólo los lados que respondieron
+			// EN ESTA página. Si el último lado activo aún no llegó a su inicio
+			// (msgId mínimo de servidor, ~2), no cerramos: omitimos la
+			// actualización para que el loader siga pidiendo páginas anteriores
+			// (evita que SparseIdsSliceBuilder marque skippedBefore=0 y "corte"
+			// la lista antes de mostrar todo el contenido).
+			const auto livePhoto = photoAnchor.has_value();
+			const auto liveFile = fileAnchor.has_value();
+			const auto photoFrom = livePhoto
+				? state->photo->noSkipRange.from
+				: MsgId(0);
+			const auto fileFrom = liveFile
+				? state->file->noSkipRange.from
+				: MsgId(0);
+			const auto photoTill = livePhoto
+				? state->photo->noSkipRange.till
+				: MsgId(0);
+			const auto fileTill = liveFile
+				? state->file->noSkipRange.till
+				: MsgId(0);
+			const auto federalFrom = qMin(photoFrom, fileFrom);
+			const auto federalTill = qMax(photoTill, fileTill);
 			// Los id de mensajes de servidor parten de ~2; un from así de bajo
 			// significa "se llegó al principio del historial".
 			constexpr auto kMinServerMsgId = 2;
-			if (federalFrom > kMinServerMsgId) {
+			// El fin real sólo existe cuando NINGÚN lado vivo sigue explorando.
+			// Un lado que llega hoy a su inicio (from==0/till==ServerMax) se
+			// cierra, pero un lado vivo con rango aún abierto (p.ej. una ventana
+			// descartada con from>2 en `Before`) debe mantener la exploración; de
+			// lo contrario un cierre de un lado arrastraría a la unión entera.
+			const auto anyContinues = [&](
+					bool live,
+					MsgId from,
+					MsgId till) {
+				if (!live) {
+					return false;
+				}
+				switch (slice) {
+				case SliceType::Before:
+					return (from > kMinServerMsgId);
+				case SliceType::After:
+					return (till < ServerMaxMsgId);
+				case SliceType::Around:
+					return (from > kMinServerMsgId)
+						|| (till < ServerMaxMsgId);
+				}
+				Unexpected("SliceType in finishOne");
+			};
+			if (anyContinues(livePhoto, photoFrom, photoTill)
+				|| anyContinues(liveFile, fileFrom, fileTill)) {
 				Depur::append(
-					QStringLiteral("[DEPUR] FP MERGE-SKIP items=0 from=%1 "
-						"(aún no es el inicio; se sigue explorando)")
-					.arg(Depur::num(federalFrom.bare)));
+					QStringLiteral("[DEPUR] FP MERGE-SKIP items=0 "
+						"(aún se explora; sin cierre)"));
 				return;
 			}
 			// Fin real: propagar el rango para que el loader cierre de forma
-			// limpia, sin sobreescribir el fullCount de la unión.
+			// limpia.
 			merged.noSkipRange = MsgRange{ federalFrom, federalTill };
 		}
+		// Protección del conteo: si alguna sub-búsqueda falló, o algún lado no
+		// aportó un total fiable, el sumatorio (ya con un 0 por el lado caído)
+		// infravaloraría el total almacenado y provocaría "fines de lista"
+		// prematuros. Sólo escribimos el conteo cuando TODO es fiable.
+		const auto fullCountToSave = (allOk && countsOk)
+			? std::optional<int>(merged.fullCount)
+			: std::nullopt;
+		Depur::append(
+			QStringLiteral("[DEPUR] FP MERGE photoItems=%1 fileItems=%2 totalItems=%3 allOk=%4")
+			.arg(Depur::num(state->photo ? state->photo->messageIds.size() : 0))
+			.arg(Depur::num(state->file ? state->file->messageIds.size() : 0))
+			.arg(Depur::num(merged.messageIds.size()))
+			.arg(allOk ? 1 : 0));
 		Depur::append(
 			QStringLiteral("[DEPUR] FP APPLY items=%1 count=%2 nsk=%3..%4 allOk=%5")
 			.arg(Depur::num(merged.messageIds.size()))
@@ -3821,18 +3995,122 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 			topicRootId,
 			monoforumPeerId,
 			SharedMediaType::FilesPhotos,
-			std::move(merged));
+			std::move(merged),
+			fullCountToSave);
+	};
+
+	const auto pageEpoch = std::make_shared<int>(pagingFor().epoch);
+	const auto updatePagingFrom = [=](
+			SharedMediaType type,
+			const Api::SearchResult &result,
+			bool droppedPage,
+			std::optional<MsgRange> rawRange) {
+		auto &paging = pagingFor();
+		if (paging.epoch != *pageEpoch) {
+			// La página pertenece a una sesión anterior (el usuario saltó a
+			// otro ancla): sus ids se mergean al storage (son válidos), pero
+			// NO deben avanzar los frentes de la sesión nueva.
+			return;
+		}
+		const auto photo = (type == SharedMediaType::Photo);
+		auto &front = photo ? paging.photoFront : paging.fileFront;
+		auto &top = photo ? paging.photoTop : paging.fileTop;
+		auto &touched = photo ? paging.photoTouched : paging.fileTouched;
+		const auto setClosed = [&](bool value) {
+			if (photo) {
+				if (slice == SliceType::After) {
+					paging.photoTopClosed = value;
+				} else {
+					paging.photoStartClosed = value;
+				}
+			} else {
+				if (slice == SliceType::After) {
+					paging.fileTopClosed = value;
+				} else {
+					paging.fileStartClosed = value;
+				}
+			}
+		};
+		touched = true;
+		// Sólo un total real del servidor (vcount) debe conservarse como
+		// "último fullCount conocido": el tamaño de una página final (constructor
+		// `messages` plano) no es un total y corrompería la estimación de la
+		// unión si llegara a usarse para un lado ya cerrado.
+		if (result.reliableCount) {
+			if (photo) {
+				paging.photoFullCount = result.fullCount;
+			} else {
+				paging.fileFullCount = result.fullCount;
+			}
+		}
+		if (!result.messageIds.empty()) {
+			const auto minmax = std::minmax_element(
+				result.messageIds.begin(),
+				result.messageIds.end());
+			front = qMin(front, *minmax.first);
+			top = qMax(top, *minmax.second);
+		} else if (droppedPage && rawRange) {
+			// Ventana descartada: el servidor devolvió mensajes pero la máscara
+			// local no aceptó ninguno (no son contenido FilesPhotos). Sus ids
+			// marcan el nuevo frente (no hay que re-visitarlos) y NO es un cierre.
+			front = qMin(front, rawRange->from);
+			top = qMax(top, rawRange->till);
+		}
+		// Los frentes NO se sincronizan entre lados en `Before`: cada uno avanza
+		// sólo con las páginas de su propio lado (`touched`, más arriba), o el
+		// lado denso volvería a recorrer la franja del lado ralo en cada página.
+		// Sincronización de top solo para After para evitar adelantamientos.
+		if (slice == SliceType::After) {
+			if (photo) {
+				paging.fileTop = qMax(paging.fileTop, top);
+				paging.fileTouched = true;
+			} else {
+				paging.photoTop = qMax(paging.photoTop, top);
+				paging.photoTouched = true;
+			}
+		}
+		Depur::append(
+			QStringLiteral("[DEPUR] FP PAGING type=%1 slice=%2 front=%3 top=%4 "
+				"photoFront=%5 fileFront=%6 photoTop=%7 fileTop=%8")
+			.arg(photo ? u"Photo"_q : u"File"_q)
+			.arg(int(slice))
+			.arg(Depur::num(front.bare))
+			.arg(Depur::num(top.bare))
+			.arg(Depur::num(paging.photoFront.bare))
+			.arg(Depur::num(paging.fileFront.bare))
+			.arg(Depur::num(paging.photoTop.bare))
+			.arg(Depur::num(paging.fileTop.bare)));
+		if (droppedPage) {
+			return;
+		}
+		const auto reachedEnd = [&] {
+			if (!result.messageIds.empty()) {
+				return false;
+			}
+			switch (slice) {
+			case SliceType::Before:
+				return result.noSkipRange.from == 0;
+			case SliceType::After:
+				return result.noSkipRange.till == ServerMaxMsgId;
+			case SliceType::Around:
+				return (result.noSkipRange.from == 0)
+					&& (result.noSkipRange.till == ServerMaxMsgId);
+			}
+			Unexpected("SliceType in updatePagingFrom");
+		}();
+		if (reachedEnd) {
+			setClosed(true);
+			Depur::append(
+				QStringLiteral("[DEPUR] FP CLOSE type=%1 dir=%2")
+				.arg(photo ? u"Photo"_q : u"File"_q)
+				.arg(int(slice)));
+		}
 	};
 
 	const auto sendOne = [=](SharedMediaType type) {
-		const auto prepared = Api::PrepareSearchRequest(
-			peer,
-			topicRootId,
-			monoforumPeerId,
-			type,
-			QString(),
-			messageId,
-			slice);
+		const auto anchor = (type == SharedMediaType::Photo)
+			? photoAnchor
+			: fileAnchor;
 		const auto captured = [&]() -> std::optional<Api::SearchResult>* {
 			if (type == SharedMediaType::Photo) {
 				return &state->photo;
@@ -3851,35 +4129,120 @@ void ApiWrap::requestSharedMediaFilesPhotos(
 			}
 			return u"File"_q;
 		}();
+		if (!anchor) {
+			// Lado ya agotado: participa en el merge como lote vacío correcto,
+			// conservando su último fullCount conocido (no un 0, que
+			// infravaloraría la estimación de la unión).
+			*captured = Api::SearchResult();
+			(*captured)->fullCount = (type == SharedMediaType::Photo)
+				? pagingFor().photoFullCount
+				: pagingFor().fileFullCount;
+			*okFlag = true;
+			Depur::append(
+				QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3 CERRADO")
+				.arg(typeName).arg(Depur::num(baseMsgId.bare))
+				.arg(int(slice)));
+			finishOne();
+			return;
+		}
+		const auto prepared = Api::PrepareSearchRequest(
+			peer,
+			topicRootId,
+			monoforumPeerId,
+			type,
+			QString(),
+			*anchor,
+			slice);
 		if (!prepared) {
 			*captured = Api::SearchResult();
+			*okFlag = true;
 			Depur::append(
 				QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3 "
-					"NO-PREPARADO").arg(typeName).arg(Depur::num(messageId.bare))
+					"NO-PREPARADO").arg(typeName).arg(Depur::num((*anchor).bare))
 				.arg(int(slice)));
 			finishOne();
 			return;
 		}
 		Depur::append(
 			QStringLiteral("[DEPUR] FP SEND type=%1 msgId=%2 slice=%3")
-			.arg(typeName).arg(Depur::num(messageId.bare)).arg(int(slice)));
+			.arg(typeName).arg(Depur::num((*anchor).bare)).arg(int(slice)));
 		historiesPtr->sendRequest(history, requestType, [=](Fn<void()> finish) {
 			return request(std::move(*prepared)
 			).done([=](const Api::SearchRequestResult &result) {
-				*captured = Api::ParseSearchResult(
-					peer,
-					type,
-					messageId,
-					slice,
-					result);
-				*okFlag = true;
+			// Antes de parsear, registramos los mensajes BRUTOS que devolvió el
+			// servidor: si todos se descartan al aplicar la máscara local, no es
+			// un fin de lista sino una ventana sin contenido aprovechable.
+			auto rawCount = 0;
+			auto rawMin = MsgId(ServerMaxMsgId);
+			auto rawMax = MsgId(0);
+			const auto foldRaw = [&](const QVector<MTPMessage> &vectors) {
+				rawCount = 0;
+				for (const auto &message : vectors) {
+					++rawCount;
+					const auto id = message.match([](const MTPDmessage &d) {
+						return MsgId(d.vid().v);
+					}, [](const MTPDmessageEmpty &d) {
+						return MsgId(d.vid().v);
+					}, [](const MTPDmessageService &d) {
+						return MsgId(d.vid().v);
+					});
+					if (id < rawMin) {
+						rawMin = id;
+					}
+					if (id > rawMax) {
+						rawMax = id;
+					}
+				}
+			};
+			switch (result.type()) {
+			case mtpc_messages_messages:
+				foldRaw(result.c_messages_messages().vmessages().v);
+				break;
+			case mtpc_messages_messagesSlice:
+				foldRaw(result.c_messages_messagesSlice().vmessages().v);
+				break;
+			case mtpc_messages_channelMessages:
+				foldRaw(result.c_messages_channelMessages().vmessages().v);
+				break;
+			case mtpc_messages_messagesNotModified:
+				break;
+			}
+		*captured = Api::ParseSearchResult(
+			peer,
+			type,
+			*anchor,
+			slice,
+			result,
+			// Para FilesPhotos aceptar toda media para asegurar que fotos y archivos
+			// se materialicen y se puedan seleccionar sin abrir chat. Lote adaptativo
+			// evita saturación.
+			true);
+			*okFlag = true;
+			const auto droppedPage = (rawCount > 0)
+				&& (*captured)->messageIds.empty();
+			const auto rawRange = droppedPage
+				? std::optional<MsgRange>(MsgRange{ rawMin, rawMax })
+				: std::nullopt;
+			if (droppedPage) {
+				// La ventana descartada no es un fin de lista: sus ids quedan
+				// registrados como cobertura (no son contenido FilesPhotos) para
+				// que el frente avance por encima de ellos.
+				(*captured)->noSkipRange = MsgRange{ rawMin, rawMax };
 				Depur::append(
-					QStringLiteral("[DEPUR] FP DONE type=%1 items=%2 nsk=%3..%4 "
-						"fullCount=%5").arg(typeName)
+					QStringLiteral("[DEPUR] FP DROP type=%1 nsk=%2..%3 "
+						"(ventana descartada; no es cierre)").arg(typeName)
+						.arg(Depur::num(rawMin.bare))
+						.arg(Depur::num(rawMax.bare)));
+			}
+			updatePagingFrom(type, **captured, droppedPage, rawRange);
+			Depur::append(
+				QStringLiteral("[DEPUR] FP DONE type=%1 items=%2 nsk=%3..%4 "
+					"fullCount=%5 reliable=%6").arg(typeName)
 					.arg(Depur::num((*captured)->messageIds.size()))
 					.arg(Depur::num((*captured)->noSkipRange.from.bare))
 					.arg(Depur::num((*captured)->noSkipRange.till.bare))
-					.arg(Depur::num((*captured)->fullCount)));
+					.arg(Depur::num((*captured)->fullCount))
+					.arg((*captured)->reliableCount ? 1 : 0));
 				finishOne();
 				finish();
 			}).fail([=](const MTP::Error &error, mtpRequestId requestId) {
@@ -4025,7 +4388,8 @@ void ApiWrap::requestSharedMediaAll(
 			topicRootId,
 			monoforumPeerId,
 			SharedMediaType::All,
-			std::move(merged));
+			std::move(merged),
+			merged.fullCount);
 	};
 
 	const auto sendOne = [=](SharedMediaType type) {
@@ -4076,16 +4440,16 @@ void ApiWrap::requestSharedMediaAll(
 		historiesPtr->sendRequest(history, requestType, [=](Fn<void()> finish) {
 			return request(std::move(*prepared)
 			).done([=](const Api::SearchRequestResult &result) {
-				*captured = Api::ParseSearchResult(
-					peer,
-					type,
-					messageId,
-					slice,
-					result);
-				*okFlag = true;
-				Depur::append(
-					QStringLiteral("[DEPUR] ALL DONE type=%1 items=%2 nsk=%3..%4 "
-						"fullCount=%5").arg(typeName)
+			*captured = Api::ParseSearchResult(
+				peer,
+				type,
+				messageId,
+				slice,
+				result);
+			*okFlag = true;
+			Depur::append(
+				QStringLiteral("[DEPUR] ALL DONE type=%1 items=%2 nsk=%3..%4 "
+					"fullCount=%5").arg(typeName)
 					.arg(Depur::num((*captured)->messageIds.size()))
 					.arg(Depur::num((*captured)->noSkipRange.from.bare))
 					.arg(Depur::num((*captured)->noSkipRange.till.bare))
@@ -4116,7 +4480,8 @@ void ApiWrap::sharedMediaDone(
 		MsgId topicRootId,
 		PeerId monoforumPeerId,
 		SharedMediaType type,
-		Api::SearchResult &&parsed) {
+		Api::SearchResult &&parsed,
+		std::optional<int> fullCount) {
 	const auto topic = peer->forumTopicFor(topicRootId);
 	const auto sublist = peer->monoforumSublistFor(monoforumPeerId);
 	if ((topicRootId && !topic) || (monoforumPeerId && !sublist)) {
@@ -4130,7 +4495,7 @@ void ApiWrap::sharedMediaDone(
 		type,
 		std::move(parsed.messageIds),
 		parsed.noSkipRange,
-		parsed.fullCount
+		fullCount
 	));
 	if (type == SharedMediaType::Pinned && hasMessages) {
 		peer->owner().history(peer)->setHasPinnedMessages(true);
@@ -4192,6 +4557,92 @@ void ApiWrap::sendAction(const SendAction &action) {
 	_sendActions.fire_copy(action);
 }
 
+namespace {
+
+// ── Reenvío masivo robusto e indefinido (Ronda 22e/23) ──────────────────────
+// La cuota invisible del servidor (~2000 reenvíos/hora) es inevitable;
+// el cliente debe DOSIFICAR para no golpearla y, cuando el servidor retenga un
+// lote, ESPERAR y CONTINUAR — nunca saltar un lote. Como la capa MTProto traga
+// silenciosamente los FLOOD_WAIT (reprograma la misma RPC), el único sensor
+// fiable es la LATENCIA de cada lote: si una respuesta tarda mucho más que la
+// pausa programada, es que el servidor nos retuvo → AIMD se endurece.
+constexpr auto kForwardChunkFastGapMs = crl::time(5000);     // ritmo rápido (arranque)
+constexpr auto kForwardChunkMinGapMs = crl::time(100000);   // 100 s: ritmo sostenible
+constexpr auto kForwardChunkMaxGapMs = crl::time(300000);   // 5 min: fondo de espera
+constexpr auto kForwardFastStartChunks = 15;                // primer bloque libre (~1500 msgs)
+constexpr auto kForwardFloodWallSecs = 7200;                // 2 h máx. de retención por flood
+constexpr auto kForwardAdaptiveStepMs = crl::time(10000);   // paso AIMD de recuperación
+constexpr auto kForwardLatencySpikeMs = crl::time(5000);    // retardo extra que delata flood
+constexpr auto kForwardProgressEveryMs = crl::time(3000);   // refresco del toast
+constexpr auto kForwardResumeEveryChunks = 5;               // persistir progreso cada N lotes
+constexpr auto kForwardResumeMagic = quint32(0x46574452);   // "FWDR"
+
+// Progreso del reenvío persistido en disco. Permite "continuar donde quedó" al
+// reenviar la misma selección al mismo destino tras un corte o reinicio de la
+// app: los ids ya confirmados se saltan en lugar de reenviarse o perderse.
+using ForwardSentSet = QSet<qint64>;
+
+struct ForwardResumeData {
+	quint64 toPeerBare = 0;
+	int sentTotal = 0;
+	ForwardSentSet sentIds;
+};
+
+[[nodiscard]] QString ForwardResumePath() {
+	return cWorkingDir() + QStringLiteral("reenvio_reanudable.dat");
+}
+
+[[nodiscard]] std::optional<ForwardResumeData> ReadForwardResume() {
+	ForwardResumeData result;
+	QFile file(ForwardResumePath());
+	if (!file.open(QIODevice::ReadOnly)) {
+		return std::nullopt;
+	}
+	QDataStream stream(&file);
+	quint32 magic = 0;
+	stream >> magic;
+	if (magic != kForwardResumeMagic) {
+		return std::nullopt;
+	}
+	stream >> result.toPeerBare >> result.sentTotal;
+	quint32 idsCount = 0;
+	stream >> idsCount;
+	result.sentIds.reserve(int(idsCount));
+	for (quint32 i = 0; i < idsCount; ++i) {
+		qint64 id = 0;
+		stream >> id;
+		result.sentIds.insert(id);
+	}
+	return result;
+}
+
+void WriteForwardResume(
+		quint64 toPeerBare,
+		int sentTotal,
+		const ForwardSentSet &sentIds) {
+	if (sentIds.isEmpty() && !sentTotal) {
+		return;
+	}
+	QFile file(ForwardResumePath());
+	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+		return;
+	}
+	QDataStream stream(&file);
+	stream << quint32(kForwardResumeMagic)
+		<< quint64(toPeerBare)
+		<< int(sentTotal)
+		<< quint32(sentIds.size());
+	for (const auto id : sentIds) {
+		stream << qint64(id);
+	}
+}
+
+void ClearForwardResume() {
+	QFile::remove(ForwardResumePath());
+}
+
+} // namespace
+
 void ApiWrap::finishForwarding(const SendAction &action) {
 	const auto history = action.history;
 	const auto topicRootId = action.replyTo.topicRootId;
@@ -4227,7 +4678,8 @@ void ApiWrap::finishForwarding(const SendAction &action) {
 void ApiWrap::forwardMessages(
 		Data::ResolvedForwardDraft &&draft,
 		SendAction action,
-		FnMut<void()> &&successCallback) {
+		FnMut<void()> &&successCallback,
+		Fn<void(int sent, int total, std::optional<int> floodWaitSecs)> progress) {
 	Expects(!draft.items.empty());
 
 	constexpr auto kMaxForwardMessages = 100;
@@ -4249,13 +4701,47 @@ void ApiWrap::forwardMessages(
 		}
 		return;
 	}
+
+	// Reanudación: si hay un archivo de progreso previo para este peer,
+	// eliminamos los ids que ya se confirmaron para no reenviarlos dos veces.
+	const auto resumeOpt = ReadForwardResume();
+	auto resumeSkipped = 0;
+	if (resumeOpt
+		&& resumeOpt->toPeerBare == quint64(action.history->peer->id.value)) {
+		const auto &sentIds = resumeOpt->sentIds;
+		const auto before = draft.items.size();
+		for (auto i = begin(draft.items); i != end(draft.items);) {
+			if (sentIds.contains((*i)->id.bare)) {
+				i = draft.items.erase(i);
+			} else {
+				++i;
+			}
+		}
+		if (draft.items.size() == before) {
+			// Selección distinta a la guardada: progreso obsoleto.
+			ClearForwardResume();
+		} else {
+			resumeSkipped = int(sentIds.size());
+			if (draft.items.empty()) {
+				Depur::append(QStringLiteral("[DEPUR] FWD Reanudación: todos los items ya enviados, limpiando."));
+				ClearForwardResume();
+				if (successCallback) {
+					successCallback();
+				}
+				return;
+			}
+			Depur::append(QStringLiteral("[DEPUR] FWD Reanudación: saltados %1 ya enviados, quedan %2.")
+				.arg(resumeSkipped)
+				.arg(draft.items.size()));
+		}
+	}
+
 	draft.options = HistoryView::Controls::NormalizeForwardOptions(
 		_session,
 		draft.items,
 		draft.options);
 
 	struct SharedCallback {
-		int requestsLeft = 0;
 		FnMut<void()> callback;
 	};
 	const auto shared = successCallback
@@ -4337,6 +4823,7 @@ void ApiWrap::forwardMessages(
 	struct ForwardChunk {
 		not_null<PeerData*> from;
 		QVector<MTPint> ids;
+		QVector<qint64> rawIds;
 		QVector<MTPlong> randomIds;
 		std::shared_ptr<base::flat_map<uint64, FullMsgId>> localIds;
 	};
@@ -4344,6 +4831,7 @@ void ApiWrap::forwardMessages(
 	chunks.reserve(1 + count / kMaxForwardMessages);
 	{
 		auto ids = QVector<MTPint>();
+		auto rawIds = QVector<qint64>();
 		auto randomIds = QVector<MTPlong>();
 		auto localIds = std::shared_ptr<base::flat_map<uint64, FullMsgId>>();
 		const auto flush = [&] {
@@ -4353,14 +4841,17 @@ void ApiWrap::forwardMessages(
 			chunks.push_back(ForwardChunk{
 				.from = forwardFrom,
 				.ids = std::move(ids),
+				.rawIds = std::move(rawIds),
 				.randomIds = std::move(randomIds),
 				.localIds = std::move(localIds),
 			});
 			ids = QVector<MTPint>();
+			rawIds = QVector<qint64>();
 			randomIds = QVector<MTPlong>();
 			localIds = nullptr;
 		};
 		ids.reserve(count);
+		rawIds.reserve(count);
 		randomIds.reserve(count);
 		for (const auto &item : draft.items) {
 			const auto randomId = base::RandomValue<uint64>();
@@ -4397,6 +4888,7 @@ void ApiWrap::forwardMessages(
 				forwardFrom = newFrom;
 			}
 			ids.push_back(MTP_int(item->id));
+			rawIds.push_back(item->id.bare);
 			randomIds.push_back(MTP_long(randomId));
 		}
 		flush();
@@ -4404,34 +4896,124 @@ void ApiWrap::forwardMessages(
 
 	const auto scheduled = action.options.scheduled;
 	const auto starsLeft = std::make_shared<int>(action.options.starsApproved);
-	const auto nextIndex = std::make_shared<int>(0);
+	const auto totalForProgress = resumeSkipped + count;
 
-	// Cadena de reenvío (estable, sin límite total y conservando la cronología):
-	// los lotes se envían de UNO en UNO — cada lote espera a que el anterior
-	// termine (con éxito o con fallo) antes de enviar el siguiente. De esta
-	// forma la cadena nunca se rompe:
-	//  - si un lote falla se reporta el error, pero se continúa reenviando el
-	//    resto hasta que se reenvía TODO lo seleccionado ("procesar hasta
-	//    terminar");
-	//  - el successCallback se dispara SIEMPRE al terminar el último lote,
-	//    aunque haya habido fallos (antes un fallo dejaba la cuenta pendiente
-	//    para siempre y la funcionalidad se quedaba colgada);
-	//  - con reenvíos de más de 1000 mensajes no se lanzan decenas de
-	//    peticiones a la vez (que provocaban flood y mensajes desordenados),
-	//    sino una sola en vuelo, manteniendo la cronología exacta y sin
-	//    sobrecargar la API.
-	// El callable recursivo de la cadena se guarda en un shared_ptr:
-	// capturarlo por valor copiaría la versión VACÍA inicial (invocar esa
-	// copia lanza std::bad_function_call -> abort y cierra la app al reenviar
-	// varios lotes), y capturarlo por referencia dejaría una referencia
-	// colgante al salir de forwardMessages. Con shared_ptr el estado vive
-	// mientras la cadena esté en vuelo y la recursión avanza de forma segura.
-	const auto sendNextChunk = std::make_shared<std::function<void()>>();
-	*sendNextChunk = [=, &histories] {
-		const auto index = (*nextIndex)++;
-		if (index >= int(chunks.size())) {
+	// ForwardPipeline: estado vivo del reenvío masivo indefinido.
+	// Guarda la cadena en un shared_ptr para que el estado viva mientras esté
+	// en vuelo (evita dangling references y copies vacías de std::function).
+	// Pacing AIMD: el hueco entre lotes se ajusta automáticamente a la cuota
+	// invisible del servidor, con reintento del MISMO lote en FLOOD_WAIT.
+	struct ForwardPipeline {
+		base::Timer pipelineTimer;
+		base::Timer watchdogTimer;
+		base::Timer progressTimer;
+
+		int nextIndex = 0;
+		int sentConfirmed = 0;
+
+		crl::time pauseMs = kForwardChunkFastGapMs;
+		crl::time lastActivityAt = crl::time();
+		crl::time lastSendAt = crl::time();
+		int fastStartChunksLeft = kForwardFastStartChunks;
+		std::int64_t floodWaitEndsAt = 0;
+		int floodRetries = 0;
+		bool inFlight = false;
+
+		base::weak_ptr<Ui::Toast::Instance> toast;
+		bool finished = false;
+	};
+	const auto pipeline = std::make_shared<ForwardPipeline>();
+	pipeline->sentConfirmed = resumeSkipped;
+	pipeline->lastActivityAt = crl::now();
+
+	const auto fireProgress = [=] {
+		if (progress) {
+			progress(pipeline->sentConfirmed, totalForProgress, std::nullopt);
+		}
+	};
+
+	const auto fireFloodProgress = [=](int waitSecs) {
+		if (progress) {
+			progress(pipeline->sentConfirmed, totalForProgress, waitSecs);
+		}
+	};
+
+	const auto showToast = [=](const QString &text, crl::time durationMs = 4000) {
+		if (const auto old = pipeline->toast.get()) {
+			old->hideAnimated();
+		}
+		pipeline->toast = Ui::Toast::Show(Ui::Toast::Config{
+			.text = text,
+			.duration = durationMs,
+		});
+	};
+
+	const auto finishPipeline = [=] {
+		if (pipeline->finished) {
 			return;
 		}
+		pipeline->finished = true;
+		pipeline->pipelineTimer.cancel();
+		pipeline->watchdogTimer.cancel();
+		pipeline->progressTimer.cancel();
+		// Romper el ciclo pipeline→timer→callback→pipeline para no filtrar
+		// el estado una vez terminado el reenvío.
+		pipeline->pipelineTimer.setCallback(nullptr);
+		pipeline->watchdogTimer.setCallback(nullptr);
+		pipeline->progressTimer.setCallback(nullptr);
+		if (const auto t = pipeline->toast.get()) {
+			t->hideAnimated();
+		}
+		ClearForwardResume();
+		if (shared) {
+			shared->callback();
+		}
+	};
+
+	// Mientras un lote está en vuelo y el servidor lo retiene (flood invisible),
+	// mostrar el tiempo de espera transcurrido para que no parezca colgado.
+	pipeline->progressTimer.setCallback([=] {
+		if (pipeline->finished || !pipeline->inFlight) {
+			return;
+		}
+		const auto elapsed = (crl::now() - pipeline->lastSendAt) / 1000;
+		if (elapsed > 0) {
+			showToast(
+				u"Esperando al servidor… %1 s"_q
+					.arg(elapsed),
+				kForwardProgressEveryMs);
+		}
+	});
+
+	pipeline->pipelineTimer.setCallback([=, &histories] {
+		if (pipeline->finished) {
+			return;
+		}
+		// Si hay un flood activo, esperar a que pase.
+		if (pipeline->floodWaitEndsAt > 0) {
+			const auto remaining = pipeline->floodWaitEndsAt
+				- (crl::now() / 1000);
+			if (remaining > 0) {
+				showToast(
+					u"Flood: faltan %1s para reanudar…"_q
+						.arg(remaining),
+					kForwardProgressEveryMs);
+				pipeline->pipelineTimer.callOnce(kForwardProgressEveryMs);
+				return;
+			}
+			// Flood terminó, reintentar el MISMO chunk.
+			pipeline->floodWaitEndsAt = 0;
+		}
+
+		const auto index = pipeline->nextIndex;
+		if (index >= int(chunks.size())) {
+			finishPipeline();
+			showToast(
+				u"Reenvío completo: %1 mensajes"_q
+					.arg(pipeline->sentConfirmed));
+			return;
+		}
+
 		const auto &chunk = chunks[index];
 		const auto idsCopy = chunk.localIds;
 		const auto fromId = chunk.from->id;
@@ -4486,35 +5068,35 @@ void ApiWrap::forwardMessages(
 				MTP_long(starsPaid),
 				Api::SuggestToMTP(action.options.suggest));
 		};
-		// Defensivo: solo se invoca un handler si realmente existe. Invocar
-		// un std::function vacío lanza std::bad_function_call (excepción no
-		// capturable en esta ruta), termina el proceso con abort() y cierra
-		// la app de forma inesperada al reenviar varios archivos a la vez.
-		const auto settle = [=] {
-			if (shared
-				&& !--shared->requestsLeft
-				&& shared->callback) {
-				shared->callback();
-			}
-			if (*nextIndex < int(chunks.size()) && *sendNextChunk) {
-				(*sendNextChunk)();
-			}
-		};
+
 		// Defensivo: si el peer de origen del lote se resuelve vacío (por
 		// ejemplo un usuario/canal cuyo acceso aún no está cargado), la API
-		// rechaza la petición con INPUT_PEERS_EMPTY. En lugar de enviar una
-		// petición inválida, se salta el lote y la cadena continúa reenviando
-		// el resto. Nunca se pierde la cuenta: se avanza al siguiente lote.
+		// rechazaría la petición. Saltamos el chunk y seguimos.
 		if (ids.isEmpty() || fromInput.type() == mtpc_inputPeerEmpty) {
-			settle();
+			pipeline->nextIndex = index + 1;
+			pipeline->sentConfirmed += int(ids.size());
+			if (pipeline->nextIndex >= int(chunks.size())) {
+				finishPipeline();
+				return;
+			}
+			pipeline->pipelineTimer.callOnce(pipeline->pauseMs);
 			return;
 		}
+
+		pipeline->lastActivityAt = crl::now();
+		pipeline->lastSendAt = crl::now();
+		pipeline->inFlight = true;
+		pipeline->progressTimer.callEach(kForwardProgressEveryMs);
+
 		histories.sendPreparedMessage(
 			history,
 			FullReplyTo{ .topicRootId = topicRootId },
 			uint64(0),
 			std::move(buildMessage),
 			[=](const MTPUpdates &result, const MTP::Response &) {
+				if (pipeline->finished) {
+					return;
+				}
 				if (!scheduled) {
 					_session->api().updates().checkForSentToScheduled(
 						result);
@@ -4526,9 +5108,87 @@ void ApiWrap::forwardMessages(
 						peer->id,
 						fromId);
 				}
-				settle();
+
+				const auto elapsed = crl::now() - pipeline->lastSendAt;
+				pipeline->inFlight = false;
+				pipeline->progressTimer.cancel();
+				pipeline->nextIndex = index + 1;
+				pipeline->sentConfirmed += int(ids.size());
+				pipeline->floodRetries = 0;
+				pipeline->lastActivityAt = crl::now();
+
+				// AIMD guiado por latencia: si el lote tardó mucho más de lo
+				// programado, el servidor nos retuvo (flood invisible) y hay
+				// que endurecer el ritmo; si respondió al vuelo, recuperamos
+				// ritmo hacia el máximo sostenible sin volver a golpear.
+				const auto spike
+					= (elapsed > pipeline->pauseMs
+						+ kForwardLatencySpikeMs);
+				if (spike) {
+					pipeline->fastStartChunksLeft = 0;
+					pipeline->pauseMs = std::min(
+						kForwardChunkMaxGapMs,
+						pipeline->pauseMs * 2);
+					pipeline->pauseMs = std::max(
+						kForwardChunkMinGapMs,
+						pipeline->pauseMs);
+				} else if (pipeline->fastStartChunksLeft > 0) {
+					--pipeline->fastStartChunksLeft;
+					if (pipeline->fastStartChunksLeft == 0) {
+						// Primer bloque libre agotado: ritmo sostenible.
+						pipeline->pauseMs = kForwardChunkMinGapMs;
+					}
+				} else {
+					pipeline->pauseMs = std::max(
+						kForwardChunkMinGapMs,
+						pipeline->pauseMs - kForwardAdaptiveStepMs);
+				}
+
+				if (spike) {
+					fireFloodProgress(int(elapsed / 1000));
+				} else {
+					fireProgress();
+				}
+
+				// Persistir progreso periódicamente: solo los ids YA
+				// confirmados (chunks anteriores a nextIndex) para que una
+				// reanudación continúe donde quedó sin duplicar.
+				if (pipeline->nextIndex % kForwardResumeEveryChunks == 0) {
+					ForwardSentSet sentIds;
+					sentIds.reserve(pipeline->nextIndex * kMaxForwardMessages);
+					for (auto i = 0; i < pipeline->nextIndex; ++i) {
+						for (const auto id : chunks[i].rawIds) {
+							sentIds.insert(id);
+						}
+					}
+					WriteForwardResume(
+						quint64(peer->id.value),
+						pipeline->sentConfirmed,
+						sentIds);
+				}
+
+				Depur::append(QStringLiteral("[DEPUR] FWD OK chunk %1/%2 sent=%3 pause=%4ms")
+					.arg(index + 1)
+					.arg(chunks.size())
+					.arg(pipeline->sentConfirmed)
+					.arg(pipeline->pauseMs));
+
+				if (pipeline->nextIndex >= int(chunks.size())) {
+					finishPipeline();
+					showToast(
+						u"Reenvío completo: %1 mensajes"_q
+							.arg(pipeline->sentConfirmed));
+					return;
+				}
+
+				pipeline->pipelineTimer.callOnce(pipeline->pauseMs);
 			},
 			[=](const MTP::Error &error, const MTP::Response &) {
+				if (pipeline->finished) {
+					return;
+				}
+				pipeline->inFlight = false;
+				pipeline->progressTimer.cancel();
 				if (idsCopy) {
 					for (const auto &[randomId, itemId] : *idsCopy) {
 						_session->api().sendMessageFail(
@@ -4540,16 +5200,100 @@ void ApiWrap::forwardMessages(
 				} else {
 					_session->api().sendMessageFail(error, peer);
 				}
-				// IMPORTANTE: un lote con fallo NO rompe la cadena. Se
-				// reporta el error y se continúa con el siguiente lote hasta
-				// reenviar todo lo seleccionado.
-				settle();
+
+				// Detectar FLOOD_WAIT_<secs> del servidor.
+				const auto type = error.type();
+				auto floodSecs = 0;
+				if (type.startsWith(u"FLOOD_WAIT_"_q)) {
+					floodSecs = type.mid(11).toInt();
+				}
+				if (floodSecs > 0) {
+					floodSecs = std::min(floodSecs, kForwardFloodWallSecs);
+					const auto endsAt = (crl::now() / 1000) + floodSecs;
+					if (endsAt > pipeline->floodWaitEndsAt) {
+						pipeline->floodWaitEndsAt = endsAt;
+					}
+					++pipeline->floodRetries;
+
+					Depur::append(QStringLiteral("[DEPUR] FWD FLOOD chunk %1/%2 wait=%3s retries=%4")
+						.arg(index + 1)
+						.arg(chunks.size())
+						.arg(floodSecs)
+						.arg(pipeline->floodRetries));
+
+					// AIMD: aumentar pausa drásticamente (decrease goodput).
+					pipeline->pauseMs = std::min(
+						kForwardChunkMaxGapMs,
+						pipeline->pauseMs * 2);
+
+					fireFloodProgress(floodSecs);
+					pipeline->pipelineTimer.callOnce(
+						kForwardProgressEveryMs); // reevaluar pronto
+					return;
+				}
+
+				// Otro error: incrementar pausa y continuar.
+				++pipeline->nextIndex;
+				pipeline->sentConfirmed += int(ids.size());
+				++pipeline->floodRetries;
+
+				Depur::append(QStringLiteral("[DEPUR] FWD FAIL chunk %1/%2 err=%3 retries=%4")
+					.arg(index + 1)
+					.arg(chunks.size())
+					.arg(type)
+					.arg(pipeline->floodRetries));
+
+				if (pipeline->nextIndex >= int(chunks.size())) {
+					finishPipeline();
+					showToast(
+						u"Reenvío terminado (con errores): %1 mensajes"_q
+							.arg(pipeline->sentConfirmed));
+					return;
+				}
+
+				fireProgress();
+				pipeline->pipelineTimer.callOnce(pipeline->pauseMs);
 			});
-	};
-	if (shared) {
-		shared->requestsLeft = int(chunks.size());
-	}
-	(*sendNextChunk)();
+	});
+
+	// Watchdog: si el pipeline se queda inactivo más del doble del muro flood
+	// y no hay flood activo, abortar limpiamente.
+	pipeline->watchdogTimer.setCallback([=] {
+		if (pipeline->finished) {
+			return;
+		}
+		const auto elapsed = crl::now() - pipeline->lastActivityAt;
+		const auto wallMs = crl::time(kForwardFloodWallSecs * 1000);
+		if (elapsed > wallMs * 2 && pipeline->floodWaitEndsAt <= 0) {
+			Depur::append(QStringLiteral("[DEPUR] FWD Watchdog: abort por inactividad %1ms")
+				.arg(elapsed));
+			showToast(u"Reenvío abortado por timeout"_q, 6000);
+			finishPipeline();
+		}
+	});
+	pipeline->watchdogTimer.callEach(crl::time(kForwardFloodWallSecs * 500));
+
+	// Iniciar la cadena.
+	pipeline->pipelineTimer.callOnce(crl::time(0));
+
+	// Si la sesión se destruye (logout, cierre) mientras el reenvío está
+	// en vuelo, cancelar las timers para evitar callbacks sobre objetos
+	// destruidos. El archivo de reanudación se mantiene intacto para que
+	// al reabrir la app el usuario pueda reenviar la selección y continuar.
+	_session->lifetime().add([
+		weak = std::weak_ptr<ForwardPipeline>(pipeline)
+	] {
+		if (const auto strong = weak.lock()) {
+			strong->pipelineTimer.cancel();
+			strong->watchdogTimer.cancel();
+			strong->progressTimer.cancel();
+			strong->pipelineTimer.setCallback(nullptr);
+			strong->watchdogTimer.setCallback(nullptr);
+			strong->progressTimer.setCallback(nullptr);
+			strong->finished = true;
+		}
+	});
+
 	_session->data().sendHistoryChangeNotifications();
 }
 

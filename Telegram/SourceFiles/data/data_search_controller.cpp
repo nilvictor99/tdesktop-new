@@ -200,7 +200,8 @@ SearchResult ParseSearchResult(
 		Storage::SharedMediaType type,
 		MsgId messageId,
 		Data::LoadDirection direction,
-		const SearchRequestResult &data) {
+		const SearchRequestResult &data,
+		bool acceptAllMedia) {
 	auto result = SearchResult();
 	result.noSkipRange = MsgRange{ messageId, messageId };
 
@@ -211,7 +212,10 @@ SearchResult ParseSearchResult(
 			peer->owner().processUsers(d.vusers());
 			peer->owner().processChats(d.vchats());
 			peer->processTopics(d.vtopics());
+			// Sin vcount: el tamaño de esta página NO es un total fiable
+			// (habitual en la última página y en conjuntos pequeños).
 			result.fullCount = d.vmessages().v.size();
+			result.reliableCount = false;
 			return &d.vmessages().v;
 		} break;
 
@@ -221,6 +225,7 @@ SearchResult ParseSearchResult(
 			peer->owner().processChats(d.vchats());
 			peer->processTopics(d.vtopics());
 			result.fullCount = d.vcount().v;
+			result.reliableCount = (d.vcount().v > 0);
 			return &d.vmessages().v;
 		} break;
 
@@ -236,6 +241,7 @@ SearchResult ParseSearchResult(
 			}
 			peer->processTopics(d.vtopics());
 			result.fullCount = d.vcount().v;
+			result.reliableCount = (d.vcount().v > 0);
 			return &d.vmessages().v;
 		} break;
 
@@ -261,8 +267,17 @@ SearchResult ParseSearchResult(
 			addType);
 		if (item) {
 			const auto itemId = item->id;
-			if ((type == Storage::SharedMediaType::kCount)
-				|| item->sharedMediaTypes().test(type)) {
+			const auto accepted = acceptAllMedia
+				// Recuperación completa: en las sub-búsquedas compuestas
+				// (FilesPhotos/All) aceptamos TODA foto/documento que devuelva
+				// el servidor, sin filtrar por la categoría del la máscara local:
+				// videos, GIF, música, voz y notas de vídeo que antes se
+				// descartaban en silencio ahora entran en la lista. Sólo se
+				// excluyen stickers/mensajes efímeros (máscara vacía).
+				? static_cast<bool>(item->sharedMediaTypes())
+				: ((type == Storage::SharedMediaType::kCount)
+					|| item->sharedMediaTypes().test(type));
+			if (accepted) {
 				result.messageIds.push_back(itemId);
 			}
 			accumulate_min(result.noSkipRange.from, itemId);

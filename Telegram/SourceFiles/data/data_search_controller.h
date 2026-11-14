@@ -28,6 +28,10 @@ struct SearchResult {
 	std::vector<MsgId> messageIds;
 	MsgRange noSkipRange;
 	int fullCount = 0;
+	// true sólo cuando fullCount es un total real del servidor (constructor
+	// `messagesSlice`/`channelMessages`, vcount). En `messages` plano el
+	// fullCount es el tamaño de la página y NO debe usarse como total.
+	bool reliableCount = false;
 };
 
 using SearchRequest = MTPmessages_Search;
@@ -72,7 +76,8 @@ struct GlobalMediaResult {
 	Storage::SharedMediaType type,
 	MsgId messageId,
 	Data::LoadDirection direction,
-	const SearchRequestResult &data);
+	const SearchRequestResult &data,
+	bool acceptAllMedia = false);
 
 [[nodiscard]] HistoryRequest PrepareHistoryRequest(
 	not_null<PeerData*> peer,

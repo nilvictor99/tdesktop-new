@@ -291,7 +291,7 @@ void InnerWidget::setupFileViewToggle() {
 	_rows.create(this);
 	_rows->show();
 	_rows->addSection(u"Lista"_q);
-	_rows->addSection(u"4"_q);
+	_rows->addSection(u"galeria"_q);
 	_rows->setActiveSectionFast(0);
 	_rows->sectionActivated(
 	) | rpl::on_next([=](int index) {
