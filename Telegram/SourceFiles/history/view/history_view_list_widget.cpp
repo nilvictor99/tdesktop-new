@@ -101,6 +101,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 namespace HistoryView {
 namespace {
 
+constexpr auto kQuickShowInChatDelay = crl::time(200);
+
+[[nodiscard]] inline bool QuickShowInChat() {
+	return Core::App().settings().readPref<bool>(
+		"media-quick-show-in-chat", false);
+}
+
 constexpr auto kPreloadedScreensCount = 4;
 constexpr auto kPreloadIfLessThanScreens = 2;
 constexpr auto kPreloadedScreensCountFull
@@ -486,6 +493,7 @@ ListWidget::ListWidget(
 	[=](const Element *view) { repaintItem(view); })
 , _touchSelectTimer([=] { onTouchSelect(); })
 , _touchScrollTimer([=] { onTouchScrollTimer(); })
+, _quickShowTimer([=] { performQuickShowInChat(); })
 , _middleClickAutoscroll(
 		[=](int d) { _delegate->listScrollTo(_visibleTop + d, false); },
 		[=](const QCursor &cursor) { setCursor(cursor); },
@@ -3312,6 +3320,10 @@ auto ListWidget::scrollKeyEvents() const
 
 void ListWidget::mouseDoubleClickEvent(QMouseEvent *e) {
 	registerReadMetricsActivity();
+	if (QuickShowInChat()) {
+		_quickShowTimer.cancel();
+		_quickShowSuppressed = true;
+	}
 	mouseActionStart(e->globalPos(), e->button());
 	trySwitchToWordSelection();
 	if (!ClickHandler::getActive()
@@ -3596,6 +3608,8 @@ void ListWidget::reactionChosen(ChosenReaction reaction) {
 }
 
 void ListWidget::mousePressEvent(QMouseEvent *e) {
+	_quickShowTimer.cancel();
+	_quickShowSuppressed = false;
 	if (_menu) {
 		e->accept();
 		return; // ignore mouse press, that was hiding context menu
@@ -4297,6 +4311,30 @@ void ListWidget::mouseActionFinish(
 
 	_wasSelectedText = false;
 
+	const auto context = elementContext();
+	const auto quickShowContext = (context == Context::Pinned
+		|| context == Context::ChatPreview);
+	const auto mediaQuickShow = activated
+		&& !dynamic_cast<VoiceSeekClickHandler*>(activated.get())
+		&& (dynamic_cast<PhotoOpenClickHandler*>(activated.get())
+			|| dynamic_cast<DocumentOpenClickHandler*>(activated.get()));
+	const auto quickShow = quickShowContext
+		&& QuickShowInChat()
+		&& button == Qt::LeftButton
+		&& pressState.itemId
+		&& !_pressWasInactive
+		&& !hasSelectedItems()
+		&& mediaQuickShow
+		&& _mouseAction != MouseAction::Dragging
+		&& _mouseAction != MouseAction::Selecting;
+	if (quickShow && !_quickShowSuppressed) {
+		_quickShowId = pressState.itemId;
+		_quickShowTimer.callOnce(kQuickShowInChatDelay);
+		_mouseAction = MouseAction::None;
+		return;
+	}
+	_quickShowSuppressed = false;
+
 	if (_mouseAction == MouseAction::Dragging || needItemSelectionToggle) {
 		activated = nullptr;
 	} else if (activated) {
@@ -4363,6 +4401,19 @@ void ListWidget::mouseActionFinish(
 		&& !_selectedTextSelection.empty()
 		&& !hasCopyRestriction(_selectedTextItem)) {
 		TextUtilities::SetClipboardText(_selectedText, QClipboard::Selection);
+	}
+}
+
+void ListWidget::performQuickShowInChat() {
+	const auto id = _quickShowId;
+	_quickShowId = FullMsgId();
+	if (!id) {
+		return;
+	}
+	if (const auto item = session().data().message(id)) {
+		if (item->isRegular()) {
+			JumpToMessageClickHandler(item)->onClick({});
+		}
 	}
 }
 

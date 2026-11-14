@@ -319,6 +319,7 @@ private:
 	void performDrag();
 	void updateAutoScroll();
 	void autoScrollStep();
+	void performQuickShowInChat();
 	[[nodiscard]] style::cursor computeMouseCursor() const;
 	void showContextMenu(
 		QContextMenuEvent *e,
@@ -368,6 +369,9 @@ private:
 	int _visibleBottom = 0;
 	ListScrollTopState _scrollTopState;
 	base::Timer _autoScrollTimer;
+	base::Timer _quickShowTimer;
+	FullMsgId _quickShowId;
+	bool _quickShowSuppressed = false;
 	bool _autoScrollActive = false;
 	rpl::event_stream<int> _scrollToRequests;
 

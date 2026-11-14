@@ -40,6 +40,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/menu/menu_common.h"
 #include "ui/widgets/menu/menu_multiline_action.h"
 #include "ui/widgets/menu/menu_separator.h"
+#include "menu/menu_checked_action.h"
 #include "ui/image/image.h"
 #include "ui/toast/toast.h"
 #include "ui/text/format_song_document_name.h"
@@ -120,6 +121,16 @@ namespace {
 constexpr auto kRescheduleLimit = 20;
 constexpr auto kTagNameLimit = 12;
 constexpr auto kPublicPostLinkToastDuration = 4 * crl::time(1000);
+
+[[nodiscard]] inline bool QuickShowInChat() {
+	return Core::App().settings().readPref<bool>(
+		"media-quick-show-in-chat", false);
+}
+
+inline void SetQuickShowInChat(bool value) {
+	Core::App().settings().writePref<bool>(
+		"media-quick-show-in-chat", value);
+}
 
 bool HasEditMessageAction(
 		const ContextMenuRequest &request,
@@ -847,11 +858,17 @@ bool AddGoToMessageAction(
 	}
 	const auto itemId = view->data()->fullId();
 	const auto controller = list->controller();
-	menu->addAction(tr::lng_context_to_msg(tr::now), crl::guard(controller, [=] {
-		if (const auto item = controller->session().data().message(itemId)) {
-			controller->showMessage(item);
-		}
-	}), &st::menuIconShowInChat);
+	Menu::AddToggleAction(
+		menu,
+		tr::lng_context_to_msg(tr::now),
+		crl::guard(controller, [=] {
+			if (const auto item = controller->session().data().message(itemId)) {
+				controller->showMessage(item);
+			}
+		}),
+		[=](bool value) { SetQuickShowInChat(value); },
+		&st::menuIconShowInChat,
+		QuickShowInChat());
 	return true;
 }
 

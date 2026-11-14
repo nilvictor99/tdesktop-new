@@ -44,7 +44,7 @@ constexpr auto kPreloadedScreensCountFull
 
 // Módulos que mantienen la ventana grande de ids también al scrollear.
 [[nodiscard]] bool WideWindowType(Type type) {
-	return (type == Type::All) || (type == Type::File);
+	return (type == Type::All) || (type == Type::File) || (type == Type::FilesPhotos);
 }
 
 // Módulos que materializan proactivamente los ids sin HistoryItem para que
@@ -70,13 +70,11 @@ Provider::Provider(not_null<AbstractController*> controller)
 , _type(_controller->section().mediaType())
 , _slice(sliceKey(_universalAroundId)) {
 	if (WideWindowType(_type)) {
-		// "Todo" y "Archivos" conservan la ventana grande de entrada. Fotos +
-		// Archivos pagina por scroll con la ventana mínima como el resto de
-		// módulos (paridad con Foto + Vídeo: cada página se pide al scrollear).
-		// En Archivos la búsqueda es una sola (solo archivos, sin unir fotos),
-		// así que la ventana grande no duplica tráfico y evita páginas de 16 en
-		// 16 al entrar: la galería se llena de una vez y sigue creciendo al
-		// scrollear sin huecos.
+		// "Todo", "Archivos" y "Fotos + Archivos" conservan la ventana grande de entrada.
+		// Evita páginas de 16 en 16 al entrar: la galería se llena de una vez y
+		// sigue creciendo al scrollear sin huecos. En Archivos la búsqueda es una
+		// sola (solo archivos, sin unir fotos) por lo que la ventana grande no duplica
+		// tráfico.
 		_idsLimit = kFullIdsLimit;
 	}
 	_controller->session().data().itemRemoved(
@@ -300,12 +298,12 @@ void Provider::checkPreload(
 			preloadRequired = (qAbs(*delta) >= minUniversalIdDelta);
 		}
 		if (preloadRequired) {
-			// Solo "Todo" y "Archivos" mantienen la ventana GRANDE también al
-			// hacer scroll. Fotos + Archivos pagina por scroll como Fotos +
-			// Vídeo: con la ventana mínima de preload el sparse-builder pide la
-			// página vecina al acercarse a un borde (insufficientAround), y cada
-			// respuesta ejecuta addNewMessage → el HistoryItem queda en memoria →
-			// no hay celdas sin contenido ni congelamiento.
+			// "Todo", "Archivos" y "Fotos + Archivos" mantienen la ventana GRANDE
+			// también al hacer scroll. El resto pagina por scroll con ventana mínima
+			// como Fotos + Vídeo: el sparse-builder pide la página vecina al acercarse
+			// a un borde (insufficientAround), y cada respuesta ejecuta addNewMessage
+			// → el HistoryItem queda en memoria → no hay celdas sin contenido ni
+			// congelamiento.
 			_idsLimit = WideWindowType(_type)
 				? kFullIdsLimit
 				: preloadIdsLimit;

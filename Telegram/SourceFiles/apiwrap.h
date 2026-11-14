@@ -798,6 +798,45 @@ private:
 		FilesPhotosPagingKey,
 		FilesPhotosPagingState> _filesPhotosPaging;
 
+	// Frentes de paginado independientes por sub-búsqueda del módulo compuesto
+	// Todo. All es la UNION de tres secuencias del servidor (Photo + Video + File);
+	// si los tres comparten un único ancla "global", los lados densos (fotos/videos)
+	// saltan su propia franja cada vez que el lado ralo (archivos) arrastra el frente,
+	// dejando contenido sin cargar. Cada lado avanza desde SU frente, de modo que
+	// las tres secuencias se agotan por completo. `front`/`top` son los extremos ya
+	// cubiertos por cada lado; `closed` indica que ese lado llegó a su fin real.
+	struct AllMediaPagingKey {
+		not_null<PeerData*> peer;
+		MsgId topicRootId = 0;
+		PeerId monoforumPeerId = 0;
+
+		friend inline auto operator<=>(const AllMediaPagingKey&, const AllMediaPagingKey&) = default;
+	};
+	struct AllMediaPagingState {
+		MsgId photoFront = 0;
+		MsgId videoFront = 0;
+		MsgId fileFront = 0;
+		MsgId photoTop = 0;
+		MsgId videoTop = 0;
+		MsgId fileTop = 0;
+		bool photoTouched = false;
+		bool videoTouched = false;
+		bool fileTouched = false;
+		bool photoStartClosed = false;
+		bool videoStartClosed = false;
+		bool fileStartClosed = false;
+		bool photoTopClosed = false;
+		bool videoTopClosed = false;
+		bool fileTopClosed = false;
+		int photoFullCount = 0;
+		int videoFullCount = 0;
+		int fileFullCount = 0;
+		int epoch = 0;
+	};
+	base::flat_map<
+		AllMediaPagingKey,
+		AllMediaPagingState> _allMediaPaging;
+
 	struct HistoryRequest {
 		not_null<PeerData*> peer;
 		MsgId aroundId = 0;
