@@ -26,23 +26,13 @@ namespace Depur {
 
 // Appends one line with a timestamp. Thread-safe. Clears the file on the very
 // first append of the process so the log is fresh for every run.
+//
+// Disabled: this trace was added while debugging the composite media modules
+// and it opens/writes a file on every call, which is very expensive in the
+// hot paths (every storage slice update and every page request). Kept as a
+// no-op so the call sites stay in place if the trace is needed again.
 inline void append(const QString &text) {
-	static QMutex mutex;
-	QMutexLocker lock(&mutex);
-	static bool initialized = false;
-	if (!initialized) {
-		initialized = true;
-		if (QFile::exists(filePath())) {
-			QFile::remove(filePath());
-		}
-	}
-	QFile file(filePath());
-	if (file.open(QIODevice::Append | QIODevice::Text)) {
-		QTextStream out(&file);
-		out << QDateTime::currentDateTime().toString(
-			QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")) << ' '
-			<< text << '\n';
-	}
+	(void)text;
 }
 
 [[nodiscard]] inline QString num(qlonglong value) {

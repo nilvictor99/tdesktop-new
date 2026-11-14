@@ -86,17 +86,16 @@ public:
 private:
 	static constexpr auto kMinimalIdsLimit = 16;
 	static constexpr auto kDefaultAroundId = (ServerMaxMsgId - 1);
-	// Para FilesPhotos/All pedimos y materializamos una ventana grande de
-	// entrada (en vez de arrancar en 16), de modo que el módulo compuesto
-	// muestre todo su contenido sin huecos ni límites visibles, igual que el
-	// módulo Media. La materialización por lotes de Ronda 18 ya hace seguro
-	// procesar esta ventana sin superar el límite de ids por petición del API.
-	// Subido a 1000 (window ≈ 2000 ids): en la unión, SparseIdsSliceBuilder poda
-	// la slice a limitBefore+limitAfter alrededor del around; una ventana
-	// pequeña recortaba el front y la petición "Before" no avanzaba hacia el
-	// inicio real (el log mostraba skipBefore≈13000 sin bajar), dejando archivos
-	// antiguos sin mostrar. Con esta ventana el front avanza mucho más por página.
+	// "Archivos" pide y materializa una ventana grande de entrada (en vez de
+	// arrancar en 16): su búsqueda es única (solo archivos) y así la galería se
+	// llena de una vez sin duplicar tráfico. La materialización por lotes
+	// mantiene seguro procesar esta ventana sin superar el límite de ids por
+	// petición del API.
 	static constexpr auto kFullIdsLimit = 1000;
+	// "Todo" (All) y "Fotos + Archivos" (FilesPhotos) son uniones en cliente de
+	// las secuencias oficiales por tipo (All: Photo + Video + File; FilesPhotos:
+	// Photo + File). Cada sub-viewer pagina por su cuenta, así que estos
+	// módulos usan la ventana normal de scroll, igual que Media.
 
 	bool sectionHasFloatingHeader() override;
 	QString sectionTitle(not_null<const BaseLayout*> item) override;
@@ -119,6 +118,28 @@ private:
 	[[nodiscard]] SparseIdsMergedSlice::Key sliceKey(
 		UniversalMsgId universalId) const;
 
+	// "Todo" (All) and "Fotos + Archivos" (FilesPhotos) are built in the client
+	// as the union of the official per-type sequences. Every sub-viewer loads
+	// through the standard path, so each fetched page materializes its messages
+	// and the sparse builders paginate contiguously, exactly like Media.
+	void refreshCompositeViewer(UniversalMsgId aroundId);
+	void applyCompositeSlice(
+		std::vector<SparseIdsMergedSlice> slices,
+		UniversalMsgId aroundId);
+	[[nodiscard]] UniversalMsgId compositeSortId(FullMsgId id) const;
+
+	[[nodiscard]] int sliceSize() const;
+	[[nodiscard]] FullMsgId sliceIdAt(int index) const;
+	[[nodiscard]] std::optional<int> sliceFullCount() const;
+	[[nodiscard]] std::optional<int> sliceSkippedBefore() const;
+	[[nodiscard]] std::optional<int> sliceSkippedAfter() const;
+	[[nodiscard]] std::optional<int> sliceIndexOf(FullMsgId id) const;
+	[[nodiscard]] std::optional<FullMsgId> sliceNearest(
+		UniversalMsgId sliceUniversalId) const;
+	[[nodiscard]] std::optional<int> sliceDistance(
+		UniversalMsgId a,
+		UniversalMsgId b) const;
+
 	void requestMissingAround(UniversalMsgId universalId);
 	void itemRemoved(not_null<const HistoryItem*> item);
 	void markLayoutsStale();
@@ -139,6 +160,14 @@ private:
 	// galería se reconstruyen los layouts con el nombre del archivo oculto.
 	int _fileGridColumns = 0;
 	SparseIdsMergedSlice _slice;
+
+	// Union state for the composite modules ("Todo" and "Fotos + Archivos"),
+	// sorted ascending by compositeSortId() (old migrated ids first, then
+	// current peer ids).
+	std::vector<FullMsgId> _compositeIds;
+	std::optional<int> _compositeFullCount;
+	std::optional<int> _compositeSkippedBefore;
+	std::optional<int> _compositeSkippedAfter;
 
 	// Advanced self-healing for composite types (FilesPhotos/All): a slice may
 	// contain universal ids whose HistoryItem is not materialized in memory

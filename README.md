@@ -55,7 +55,8 @@ Todo lo que hace distinta esta build frente al Telegram Desktop original.
 | 21 | Borrado masivo fiable | Lotes de 100 al servidor; los borrados NO reaparecen |
 
 ### Estabilidad de carga
-- Ventana de carga grande (≈2000 ids) en "Todo" y "Fotos + Archivos", mantenida al hacer scroll.
+- Carga progresiva por scroll en "Todo" y "Fotos + Archivos": unión en cliente de las secuencias oficiales por tipo (Todo: fotos + vídeos + archivos; Fotos + Archivos: fotos + archivos), sin paging compuesto ni dependencia de "Mostrar en el chat".
+- Ventana de carga grande (≈1000 ids) en "Archivos", mantenida al hacer scroll.
 - Materialización proactiva de todo el contenido, con paralelismo acotado (3 peticiones en vuelo) para no congelar la app.
 - Fin de lista honesto (sin "tope fantasma" que cortase la lista antes de tiempo).
 - Anti-bucle de reintentos y auto-reparación de búsquedas fallidas (PEER_ID_INVALID / red).

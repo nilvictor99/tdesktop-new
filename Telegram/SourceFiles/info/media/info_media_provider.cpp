@@ -17,9 +17,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "lang/lang_keys.h"
 #include "logs.h"
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <rpl/combine.h>
 #include "history/history.h"
 #include "history/history_item.h"
 #include "history/history_item_helpers.h"
@@ -44,7 +46,13 @@ constexpr auto kPreloadedScreensCountFull
 
 // Módulos que mantienen la ventana grande de ids también al scrollear.
 [[nodiscard]] bool WideWindowType(Type type) {
-	return (type == Type::All) || (type == Type::File) || (type == Type::FilesPhotos);
+	return (type == Type::File);
+}
+
+// Módulos construidos en cliente como unión de secuencias oficiales por tipo
+// ("Todo" y "Fotos + Archivos").
+[[nodiscard]] bool IsCompositeType(Type type) {
+	return (type == Type::All) || (type == Type::FilesPhotos);
 }
 
 // Módulos que materializan proactivamente los ids sin HistoryItem para que
@@ -53,6 +61,14 @@ constexpr auto kPreloadedScreensCountFull
 	return (type == Type::FilesPhotos)
 		|| (type == Type::All)
 		|| (type == Type::File);
+}
+
+[[nodiscard]] std::optional<int> AddCounts(
+		const std::optional<int> &a,
+		const std::optional<int> &b) {
+	return (a && b)
+		? std::make_optional(*a + *b)
+		: std::nullopt;
 }
 
 } // namespace
@@ -70,11 +86,9 @@ Provider::Provider(not_null<AbstractController*> controller)
 , _type(_controller->section().mediaType())
 , _slice(sliceKey(_universalAroundId)) {
 	if (WideWindowType(_type)) {
-		// "Todo", "Archivos" y "Fotos + Archivos" conservan la ventana grande de entrada.
-		// Evita páginas de 16 en 16 al entrar: la galería se llena de una vez y
-		// sigue creciendo al scrollear sin huecos. En Archivos la búsqueda es una
-		// sola (solo archivos, sin unir fotos) por lo que la ventana grande no duplica
-		// tráfico.
+		// "Archivos" conserva la ventana grande de entrada. Evita páginas de 16
+		// en 16 al entrar: su búsqueda es única (solo archivos), así que la
+		// galería se llena de una vez sin duplicar tráfico.
 		_idsLimit = kFullIdsLimit;
 	}
 	_controller->session().data().itemRemoved(
@@ -243,7 +257,7 @@ bool Provider::isPossiblyMyPeerId(PeerId peerId) const {
 }
 
 std::optional<int> Provider::fullCount() {
-	return _slice.fullCount();
+	return sliceFullCount();
 }
 
 void Provider::restart() {
@@ -253,6 +267,11 @@ void Provider::restart() {
 		? kFullIdsLimit
 		: kMinimalIdsLimit;
 	_slice = SparseIdsMergedSlice(sliceKey(_universalAroundId));
+	_compositeIds.clear();
+	_compositeFullCount
+		= _compositeSkippedBefore
+		= _compositeSkippedAfter
+		= std::nullopt;
 	Depur::append(
 		QStringLiteral("[DEPUR] RESTART type=%1 around=%2 limit=%3")
 		.arg(int(_type))
@@ -275,9 +294,9 @@ void Provider::checkPreload(
 	const auto preloadIdsLimitMin = (preloadedCount / 2) + 1;
 	const auto preloadIdsLimit = preloadIdsLimitMin
 		+ (visibleHeight / minItemHeight);
-	const auto after = _slice.skippedAfter();
+	const auto after = sliceSkippedAfter();
 	const auto topLoaded = after && (*after == 0);
-	const auto before = _slice.skippedBefore();
+	const auto before = sliceSkippedBefore();
 	const auto bottomLoaded = before && (*before == 0);
 
 	const auto minScreenDelta = kPreloadedScreensCount
@@ -291,32 +310,21 @@ void Provider::checkPreload(
 			preloadRequired = (_idsLimit < preloadIdsLimitMin);
 		}
 		if (!preloadRequired) {
-			auto delta = _slice.distance(
-				sliceKey(_universalAroundId),
-				sliceKey(universalId));
+			auto delta = sliceDistance(_universalAroundId, universalId);
 			Assert(delta != std::nullopt);
 			preloadRequired = (qAbs(*delta) >= minUniversalIdDelta);
 		}
 		if (preloadRequired) {
-			// "Todo", "Archivos" y "Fotos + Archivos" mantienen la ventana GRANDE
-			// también al hacer scroll. El resto pagina por scroll con ventana mínima
-			// como Fotos + Vídeo: el sparse-builder pide la página vecina al acercarse
-			// a un borde (insufficientAround), y cada respuesta ejecuta addNewMessage
+			// "Archivos" mantiene la ventana GRANDE también al hacer scroll.
+			// Todo, Fotos + Archivos y Media pagina por scroll con ventana
+			// mínima: el sparse-builder pide la página vecina al acercarse a un
+			// borde (insufficientAround), y cada respuesta ejecuta addNewMessage
 			// → el HistoryItem queda en memoria → no hay celdas sin contenido ni
 			// congelamiento.
 			_idsLimit = WideWindowType(_type)
 				? kFullIdsLimit
 				: preloadIdsLimit;
 			_universalAroundId = universalId;
-			Depur::append(
-				QStringLiteral("[DEPUR] PRELOAD peer=%1 type=%2 around=%3 "
-					"limit=%4 top=%5 / bottom=%6").arg(
-					Depur::num(_peer->id.value))
-				.arg(int(_type))
-				.arg(Depur::num(_universalAroundId.bare))
-				.arg(Depur::num(_idsLimit))
-				.arg(preloadTop ? 1 : 0)
-				.arg(preloadBottom ? 1 : 0));
 			refreshViewer();
 		}
 	};
@@ -331,6 +339,10 @@ void Provider::checkPreload(
 void Provider::refreshViewer() {
 	_viewerLifetime.destroy();
 	const auto idForViewer = sliceKey(_universalAroundId).universalId;
+	if (IsCompositeType(_type)) {
+		refreshCompositeViewer(idForViewer);
+		return;
+	}
 	_controller->mediaSourceOfType(
 		_controller->section().mediaType(),
 		idForViewer,
@@ -352,28 +364,11 @@ void Provider::refreshViewer() {
 		_missingRequested = false;
 		_missingRetries = 0;
 		if (ProactiveType(_type)) {
-			const auto skippedBefore = _slice.skippedBefore();
-			const auto skippedAfter = _slice.skippedAfter();
-			Depur::append(
-				QStringLiteral("[DEPUR] REFRESH type=%1 slice=%2 full=%3 "
-					"around=%4 skipBefore=%5 skipAfter=%6").arg(int(_type))
-				.arg(Depur::num(_slice.size()))
-				.arg(Depur::num(_slice.fullCount().value_or(0)))
-				.arg(Depur::num(_universalAroundId.bare))
-				.arg(skippedBefore.has_value()
-					? Depur::num(*skippedBefore)
-					: QStringLiteral("?"))
-				.arg(skippedAfter.has_value()
-					? Depur::num(*skippedAfter)
-					: QStringLiteral("?")));
-		}
-		if (ProactiveType(_type)) {
 			// Materialización PROACTIVA: nada más llegar la slice, pedimos que
 			// se materialicen todos sus ids sin HistoryItem (lotes ≤100). Así la
 			// ventana se rellena de una vez y no quedan archivos que solo
 			// aparecían al usar "mostrar en el chat" (que re-materializa el
-			// Historial). El guard _missingRequested evita duplicar peticiones;
-			// en FilesPhotos solo se materializa la ventana visible (±400) y
+			// Historial). El guard _missingRequested evita duplicar peticiones y
 			// _missingRetries evita bucles con ids borrados, refrescándose por
 			// zona (no por slice) para no encender un pase tras cada página.
 			requestMissingAround(_universalAroundId);
@@ -384,6 +379,193 @@ void Provider::refreshViewer() {
 
 rpl::producer<> Provider::refreshed() {
 	return _refreshed.events();
+}
+
+void Provider::refreshCompositeViewer(UniversalMsgId aroundId) {
+	// New region: give the materialization pass a fresh retry budget. The
+	// in-flight guard (_missingRequested) is kept, so a pass already running
+	// for the previous region is not duplicated.
+	_missingRetries = 0;
+	const auto limit = _idsLimit;
+	const auto source = [&](Type type) {
+		return _controller->mediaSourceOfType(
+			type,
+			aroundId,
+			limit,
+			limit);
+	};
+	if (_type == Type::All) {
+		rpl::combine(
+			source(Type::Photo),
+			source(Type::Video),
+			source(Type::File)
+		) | rpl::on_next([=](
+				SparseIdsMergedSlice photo,
+				SparseIdsMergedSlice video,
+				SparseIdsMergedSlice file) {
+			auto slices = std::vector<SparseIdsMergedSlice>();
+			slices.reserve(3);
+			slices.push_back(std::move(photo));
+			slices.push_back(std::move(video));
+			slices.push_back(std::move(file));
+			applyCompositeSlice(std::move(slices), aroundId);
+		}, _viewerLifetime);
+	} else {
+		rpl::combine(
+			source(Type::Photo),
+			source(Type::File)
+		) | rpl::on_next([=](
+				SparseIdsMergedSlice photo,
+				SparseIdsMergedSlice file) {
+			auto slices = std::vector<SparseIdsMergedSlice>();
+			slices.reserve(2);
+			slices.push_back(std::move(photo));
+			slices.push_back(std::move(file));
+			applyCompositeSlice(std::move(slices), aroundId);
+		}, _viewerLifetime);
+	}
+}
+
+void Provider::applyCompositeSlice(
+		std::vector<SparseIdsMergedSlice> slices,
+		UniversalMsgId aroundId) {
+	// Show whatever sequences are already known instead of waiting for all
+	// the counts: if one search is slow (or fails) the others must still fill
+	// the grid. The exact total is only used for the section counter.
+	auto ids = std::vector<FullMsgId>();
+	auto reserve = 0;
+	for (const auto &slice : slices) {
+		reserve += slice.size();
+	}
+	ids.reserve(size_t(reserve));
+	auto fullCount = std::optional<int>(0);
+	auto skippedBefore = std::optional<int>(0);
+	auto skippedAfter = std::optional<int>(0);
+	for (const auto &slice : slices) {
+		for (auto i = 0, count = slice.size(); i != count; ++i) {
+			ids.push_back(slice[i]);
+		}
+		fullCount = AddCounts(fullCount, slice.fullCount());
+		skippedBefore = AddCounts(skippedBefore, slice.skippedBefore());
+		skippedAfter = AddCounts(skippedAfter, slice.skippedAfter());
+	}
+	std::sort(ids.begin(), ids.end(), [=](FullMsgId a, FullMsgId b) {
+		return compositeSortId(a) < compositeSortId(b);
+	});
+	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+	_compositeIds = std::move(ids);
+	_compositeFullCount = fullCount;
+	_compositeSkippedBefore = skippedBefore;
+	_compositeSkippedAfter = skippedAfter;
+	if (const auto nearest = sliceNearest(aroundId)) {
+		_universalAroundId = GetUniversalId(*nearest);
+	}
+	if (ProactiveType(_type)) {
+		// Any id of the union whose HistoryItem was unloaded from memory is
+		// materialized here, so the visible region never stays blank and the
+		// user doesn't need "Show in chat" to make thumbnails appear.
+		requestMissingAround(_universalAroundId);
+	}
+	_refreshed.fire({});
+}
+
+UniversalMsgId Provider::compositeSortId(FullMsgId id) const {
+	// Same convention as SparseIdsMergedSlice::UniversalMsgId: positive for
+	// the current peer, negative (msg - ServerMaxMsgId) for migrated ones.
+	return (id.peer == _peer->id)
+		? UniversalMsgId(id.msg)
+		: UniversalMsgId(id.msg - ServerMaxMsgId);
+}
+
+int Provider::sliceSize() const {
+	return IsCompositeType(_type) ? int(_compositeIds.size()) : _slice.size();
+}
+
+FullMsgId Provider::sliceIdAt(int index) const {
+	return IsCompositeType(_type) ? _compositeIds[index] : _slice[index];
+}
+
+std::optional<int> Provider::sliceFullCount() const {
+	return IsCompositeType(_type) ? _compositeFullCount : _slice.fullCount();
+}
+
+std::optional<int> Provider::sliceSkippedBefore() const {
+	return IsCompositeType(_type)
+		? _compositeSkippedBefore
+		: _slice.skippedBefore();
+}
+
+std::optional<int> Provider::sliceSkippedAfter() const {
+	return IsCompositeType(_type)
+		? _compositeSkippedAfter
+		: _slice.skippedAfter();
+}
+
+std::optional<int> Provider::sliceIndexOf(FullMsgId id) const {
+	if (!IsCompositeType(_type)) {
+		return _slice.indexOf(id);
+	}
+	const auto it = std::lower_bound(
+		_compositeIds.begin(),
+		_compositeIds.end(),
+		compositeSortId(id),
+		[=](FullMsgId a, UniversalMsgId b) {
+			return compositeSortId(a) < b;
+		});
+	if (it != _compositeIds.end() && (*it == id)) {
+		return int(it - _compositeIds.begin());
+	}
+	return std::nullopt;
+}
+
+std::optional<FullMsgId> Provider::sliceNearest(
+		UniversalMsgId sliceUniversalId) const {
+	if (!IsCompositeType(_type)) {
+		return _slice.nearest(sliceUniversalId);
+	}
+	const auto it = std::lower_bound(
+		_compositeIds.begin(),
+		_compositeIds.end(),
+		sliceUniversalId,
+		[=](FullMsgId a, UniversalMsgId b) {
+			return compositeSortId(a) < b;
+		});
+	if (it != _compositeIds.end()) {
+		return *it;
+	} else if (!_compositeIds.empty()) {
+		return _compositeIds.back();
+	}
+	return std::nullopt;
+}
+
+std::optional<int> Provider::sliceDistance(
+		UniversalMsgId a,
+		UniversalMsgId b) const {
+	if (!IsCompositeType(_type)) {
+		return _slice.distance(sliceKey(a), sliceKey(b));
+	}
+	const auto indexOf = [=](UniversalMsgId id) -> std::optional<int> {
+		const auto sliceId = sliceKey(id).universalId;
+		const auto it = std::lower_bound(
+			_compositeIds.begin(),
+			_compositeIds.end(),
+			sliceId,
+			[=](FullMsgId a, UniversalMsgId b) {
+				return compositeSortId(a) < b;
+			});
+		if (it != _compositeIds.end() && (compositeSortId(*it) == sliceId)) {
+			return int(it - _compositeIds.begin());
+		}
+		return std::nullopt;
+	};
+	if (const auto i = indexOf(a)) {
+		if (const auto j = indexOf(b)) {
+			return *j - *i;
+		}
+	}
+	// Missing ids (for example, just removed): force a preload pass instead
+	// of failing the Assert in checkPreload().
+	return _idsLimit;
 }
 
 void Provider::setMediaFilter(MediaFilter filter) {
@@ -428,11 +610,11 @@ std::vector<ListSection> Provider::fillSections(
 
 	auto result = std::vector<ListSection>();
 	auto section = ListSection(_type, sectionDelegate());
-	auto count = _slice.size();
+	auto count = sliceSize();
 	auto missingCount = 0;
 	auto addedCount = 0;
 	for (auto i = count; i != 0;) {
-		auto universalId = GetUniversalId(_slice[--i]);
+		auto universalId = GetUniversalId(sliceIdAt(--i));
 		auto layout = getLayout(universalId, delegate);
 		if (layout && !matchesFilter(layout->getItem())) {
 			continue;
@@ -494,9 +676,9 @@ void Provider::requestMissingAround(
 		MsgId msgId;
 	};
 	auto missing = std::vector<MissingId>();
-	missing.reserve(_slice.size());
-	for (auto i = int(_slice.size()); i != 0;) {
-		const auto uid = GetUniversalId(_slice[--i]);
+	missing.reserve(sliceSize());
+	for (auto i = sliceSize(); i != 0;) {
+		const auto uid = GetUniversalId(sliceIdAt(--i));
 		const auto full = computeFullId(uid);
 		if (!session->data().message(full)) {
 			missing.push_back({ full.peer, full.msg });
@@ -518,7 +700,7 @@ void Provider::requestMissingAround(
 		QStringLiteral("[DEPUR] MATER start type=%1 peer=%2 slice=%3 missing=%4")
 		.arg(int(_type))
 		.arg(Depur::num(_peer->id.value))
-		.arg(Depur::num(_slice.size()))
+		.arg(Depur::num(sliceSize()))
 		.arg(Depur::num(missing.size())));
 	// Cola de materialización: en lugar de pedir los lotes UNO a uno (en una
 	// zona de 1000 ids eran ~10 pasadas de red seguidas y la cuadrícula parecía
@@ -637,7 +819,7 @@ void Provider::requestMissingAround(
 				.arg(Depur::num(state->missing.size()))
 				.arg(Depur::num(materialized))
 				.arg(Depur::num(stillMissing))
-				.arg(Depur::num(_slice.size()))
+				.arg(Depur::num(sliceSize()))
 				.arg(Depur::num(_missingRetries)));
 			// Romper el ciclo state->startMore->batchSettled->state para que el
 			// estado se libere del todo cuando el provider desaparezca (aquí ya
@@ -701,6 +883,26 @@ void Provider::jumpToMessage(
 		Fn<void(FullMsgId)> callback) {
 	_viewerLifetime.destroy();
 
+	const auto finish = [=] {
+		const auto fullId = FullMsgId(_peer->id, messageId);
+		_universalAroundId = GetUniversalId(fullId);
+		if (callback) {
+			callback(fullId);
+		}
+		_idsLimit = WideWindowType(_type)
+			? kFullIdsLimit
+			: kMinimalIdsLimit * 2;
+		refreshViewer();
+	};
+
+	if (IsCompositeType(_type)) {
+		// The union is loaded per type, so there is no composite search to
+		// preload here: the sub-viewers request their pages around the target
+		// id from refreshViewer().
+		finish();
+		return;
+	}
+
 	const auto peer = _controller->session().data().peer(_peer->id);
 	const auto request = Api::PrepareSearchRequest(
 		peer,
@@ -714,18 +916,6 @@ void Provider::jumpToMessage(
 	if (!request) {
 		return;
 	}
-
-	const auto finish = [=] {
-		const auto fullId = FullMsgId(_peer->id, messageId);
-		_universalAroundId = GetUniversalId(fullId);
-		if (callback) {
-			callback(fullId);
-		}
-		_idsLimit = WideWindowType(_type)
-			? kFullIdsLimit
-			: kMinimalIdsLimit * 2;
-		refreshViewer();
-	};
 
 	_controller->session().api().request(
 		std::move(*request)
@@ -757,7 +947,7 @@ void Provider::jumpToMessage(
 }
 
 bool Provider::anchorWhileAtTop() {
-	const auto after = _slice.skippedAfter();
+	const auto after = sliceSkippedAfter();
 	return !after || (*after > 0);
 }
 
@@ -1004,9 +1194,13 @@ int64 Provider::scrollTopStatePosition(not_null<HistoryItem*> item) {
 }
 
 HistoryItem *Provider::scrollTopStateItem(ListScrollTopState state) {
-	if (state.item && _slice.indexOf(state.item->fullId())) {
+	if (state.item && sliceIndexOf(state.item->fullId())) {
 		return state.item;
-	} else if (const auto id = _slice.nearest(state.position)) {
+	}
+	const auto slicePosition = IsCompositeType(_type)
+		? sliceKey(state.position).universalId
+		: UniversalMsgId(state.position);
+	if (const auto id = sliceNearest(slicePosition)) {
 		if (const auto item = _controller->session().data().message(*id)) {
 			return item;
 		}

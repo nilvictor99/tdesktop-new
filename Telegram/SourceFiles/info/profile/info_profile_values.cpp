@@ -611,6 +611,10 @@ rpl::producer<int> SharedMediaCountValue(
 		});
 	}
 	if (type == Type::All) {
+		// "Todo" is the union of "Fotos", "Videos" and "Archivos". The
+		// "Archivos" query is a documents search (inputMessagesFilterDocument),
+		// so it never returns videos: the Videos sequence must be added
+		// explicitly or they would be missing from the counter.
 		return rpl::combine(
 			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Photo),
 			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Video),
