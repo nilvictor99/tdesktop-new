@@ -394,36 +394,20 @@ void Provider::refreshCompositeViewer(UniversalMsgId aroundId) {
 			limit,
 			limit);
 	};
-	if (_type == Type::All) {
-		rpl::combine(
-			source(Type::Photo),
-			source(Type::Video),
-			source(Type::File)
-		) | rpl::on_next([=](
-				SparseIdsMergedSlice photo,
-				SparseIdsMergedSlice video,
-				SparseIdsMergedSlice file) {
-			auto slices = std::vector<SparseIdsMergedSlice>();
-			slices.reserve(3);
-			slices.push_back(std::move(photo));
-			slices.push_back(std::move(video));
-			slices.push_back(std::move(file));
-			applyCompositeSlice(std::move(slices), aroundId);
-		}, _viewerLifetime);
-	} else {
-		rpl::combine(
-			source(Type::Photo),
-			source(Type::File)
-		) | rpl::on_next([=](
-				SparseIdsMergedSlice photo,
-				SparseIdsMergedSlice file) {
-			auto slices = std::vector<SparseIdsMergedSlice>();
-			slices.reserve(2);
-			slices.push_back(std::move(photo));
-			slices.push_back(std::move(file));
-			applyCompositeSlice(std::move(slices), aroundId);
-		}, _viewerLifetime);
-	}
+	// Ambos módulos compuestos son la unión de Fotos + Archivos, igual que
+	// "Fotos + Archivos": los vídeos no forman parte de "Todo".
+	rpl::combine(
+		source(Type::Photo),
+		source(Type::File)
+	) | rpl::on_next([=](
+			SparseIdsMergedSlice photo,
+			SparseIdsMergedSlice file) {
+		auto slices = std::vector<SparseIdsMergedSlice>();
+		slices.reserve(2);
+		slices.push_back(std::move(photo));
+		slices.push_back(std::move(file));
+		applyCompositeSlice(std::move(slices), aroundId);
+	}, _viewerLifetime);
 }
 
 void Provider::applyCompositeSlice(
@@ -1067,23 +1051,6 @@ std::unique_ptr<BaseLayout> Provider::createLayout(
 		}
 		return nullptr;
 	case Type::FilesPhotos:
-		if (const auto photo = getPhoto()) {
-			return std::make_unique<Photo>(
-				delegate,
-				item,
-				photo,
-				options());
-		} else if (const auto file = getFile()) {
-			return std::make_unique<Document>(
-				delegate,
-				item,
-				DocumentFields{
-					.document = file,
-					.hideName = true,
-				},
-				songSt);
-		}
-		return nullptr;
 	case Type::All:
 		if (const auto photo = getPhoto()) {
 			return std::make_unique<Photo>(
@@ -1092,9 +1059,6 @@ std::unique_ptr<BaseLayout> Provider::createLayout(
 				photo,
 				options());
 		} else if (const auto file = getFile()) {
-			if (file->isVideoFile()) {
-				return std::make_unique<Video>(delegate, item, file, options());
-			}
 			return std::make_unique<Document>(
 				delegate,
 				item,

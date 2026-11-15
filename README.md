@@ -40,7 +40,7 @@ Todo lo que hace distinta esta build frente al Telegram Desktop original.
 | 10 | Botón único "Media" | Fotos y videos juntos en el perfil (incluye layout classic del canal) |
 | 11 | Filtros Todo / Fotos / Videos | Submenú superior de la galería unificada (sin GIF), "Todo" por defecto |
 | 12 | Pestañas ocultas si vacías | Fotos/Videos solo se muestran si hay contenido de ese tipo |
-| 13 | Módulo "Todo" (All) | Una cuadrícula con fotos + videos + archivos (sin stickers/GIF/voz), carga completa y orden cronológico |
+| 13 | Módulo "Todo" (All) | Una cuadrícula con fotos + archivos (sin videos, stickers/GIF/voz), carga completa y orden cronológico |
 | 14 | Módulo "Fotos + Archivos" | En el perfil del canal: fotos y archivos juntos (sin videos), con lazy loading, conteo combinado, soporte de foros/temas, carga completa y nombres de archivo ocultos; se obtiene fusionando dos búsquedas MTP (Photo + File) |
 
 ### Reenvío y borrado masivos
@@ -55,7 +55,7 @@ Todo lo que hace distinta esta build frente al Telegram Desktop original.
 | 21 | Borrado masivo fiable | Lotes de 100 al servidor; los borrados NO reaparecen |
 
 ### Estabilidad de carga
-- Carga progresiva por scroll en "Todo" y "Fotos + Archivos": unión en cliente de las secuencias oficiales por tipo (Todo: fotos + vídeos + archivos; Fotos + Archivos: fotos + archivos), sin paging compuesto ni dependencia de "Mostrar en el chat".
+- Carga progresiva por scroll en "Todo" y "Fotos + Archivos": unión en cliente de las secuencias oficiales por tipo (ambos: fotos + archivos), sin paging compuesto ni dependencia de "Mostrar en el chat".
 - Ventana de carga grande (≈1000 ids) en "Archivos", mantenida al hacer scroll.
 - Materialización proactiva de todo el contenido, con paralelismo acotado (3 peticiones en vuelo) para no congelar la app.
 - Fin de lista honesto (sin "tope fantasma" que cortase la lista antes de tiempo).
