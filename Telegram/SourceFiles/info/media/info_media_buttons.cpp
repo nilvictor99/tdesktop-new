@@ -53,7 +53,9 @@ namespace {
 		|| (type == Type::Link)
 		|| (type == Type::RoundVoiceFile)
 		|| (type == Type::GIF)
-		|| (type == Type::Poll);
+		|| (type == Type::Poll)
+		|| (type == Type::FilesPhotos)
+		|| (type == Type::All);
 }
 
 void AddContextMenuToButton(

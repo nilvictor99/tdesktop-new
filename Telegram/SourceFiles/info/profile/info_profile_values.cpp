@@ -602,14 +602,25 @@ rpl::producer<int> SharedMediaCountValue(
 		PeerData *migrated,
 		Storage::SharedMediaType type) {
 	using Type = Storage::SharedMediaType;
-	if (type == Type::FilesPhotos || type == Type::All) {
-		// "Todo" y "Fotos + Archivos" son la unión de Fotos + Archivos. Los
-		// vídeos no forman parte de ninguno de los dos.
+	if (type == Type::FilesPhotos) {
 		return rpl::combine(
 			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Photo),
 			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::File)
 		) | rpl::map([](int photos, int files) {
 			return photos + files;
+		});
+	}
+	if (type == Type::All) {
+		// "Todo" is the union of "Fotos", "Videos" and "Archivos". The
+		// "Archivos" query is a documents search (inputMessagesFilterDocument),
+		// so it never returns videos: the Videos sequence must be added
+		// explicitly or they would be missing from the counter.
+		return rpl::combine(
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Photo),
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::Video),
+			SharedMediaCountValue(peer, topicRootId, monoforumPeerId, migrated, Type::File)
+		) | rpl::map([](int photos, int videos, int files) {
+			return photos + videos + files;
 		});
 	}
 	auto aroundId = 0;
