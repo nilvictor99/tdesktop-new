@@ -172,7 +172,9 @@ ListWidget::DateBadge::DateBadge(
 , goodType(type == Type::Photo
 	|| type == Type::Video
 	|| type == Type::PhotoVideo
-	|| type == Type::GIF) {
+	|| type == Type::GIF
+	|| type == Type::FilesPhotos
+	|| type == Type::All) {
 }
 
 ListWidget::ListWidget(

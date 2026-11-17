@@ -46,7 +46,7 @@ constexpr auto kPreloadedScreensCountFull
 
 // Módulos que mantienen la ventana grande de ids también al scrollear.
 [[nodiscard]] bool WideWindowType(Type type) {
-	return (type == Type::File);
+	return (type == Type::File) || (type == Type::All);
 }
 
 // Módulos construidos en cliente como unión de secuencias oficiales por tipo
@@ -395,9 +395,19 @@ void Provider::refreshCompositeViewer(UniversalMsgId aroundId) {
 			limit);
 	};
 	if (_type == Type::All) {
+		// Vídeos se cargan con ventana más pequeña para aligerar la unión,
+		// manteniendo la ventana grande para Fotos y Archivos.
+		const auto videoLimit = std::min(limit, kMinimalIdsLimit * 2);
+		const auto sourceVideo = [&]() {
+			return _controller->mediaSourceOfType(
+				Type::Video,
+				aroundId,
+				videoLimit,
+				videoLimit);
+		};
 		rpl::combine(
 			source(Type::Photo),
-			source(Type::Video),
+			sourceVideo(),
 			source(Type::File)
 		) | rpl::on_next([=](
 				SparseIdsMergedSlice photo,
